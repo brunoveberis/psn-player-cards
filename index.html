@@ -1,1 +1,86 @@
+<!DOCTYPE html>
+<html lang="lv">
+<head>
+  <meta charset="UTF-8">
+  <title>Latvijas PlayStation Geimeru Rankings</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
 
+  <main>
+    <h1>Latvijas PlayStation Geimeru Rankings</h1>
+
+    <a
+      class="register-button"
+      href="https://forms.gle/en3szfAouM3Ec4r68"
+      target="_blank"
+      rel="noopener"
+    >
+      Reģistrēt PSN nickname
+    </a>
+
+    <p class="update-note">
+      Saraksts tiek atjaunināts automātiski vienu reizi dienā.
+    </p>
+
+    <div id="content-players" class="content"></div>
+  </main>
+
+  <script>
+    async function loadPlayers() {
+      try {
+        const response = await fetch("./players.json?cache=" + Date.now());
+        const players = await response.json();
+        renderPlayers(players);
+      } catch (error) {
+        document.getElementById("content-players").innerHTML =
+          "<p>Spēlētāji vēl nav ielādēti.</p>";
+      }
+    }
+
+    function renderPlayers(players) {
+      const container = document.getElementById("content-players");
+
+      if (!players.length) {
+        container.innerHTML = "<p>Neviens spēlētājs vēl nav reģistrēts.</p>";
+        return;
+      }
+
+      container.innerHTML = players.map((player, index) => {
+        const nameForUrl = encodeURIComponent(player.name);
+
+        return `
+          <section class="player-section">
+            <div class="player-row">
+              <div class="player-name">
+                <h3>${index + 1}. ${escapeHtml(player.name)}</h3>
+              </div>
+
+              <div class="player-card">
+                <a href="https://www.exophase.com/psn/user/${nameForUrl}/" target="_blank" rel="noopener">
+                  <img src="https://card.exophase.com/psn/${nameForUrl}.png" alt="${escapeHtml(player.name)} PSN card">
+                </a>
+              </div>
+            </div>
+          </section>
+        `;
+      }).join("");
+    }
+
+    function escapeHtml(text) {
+      return String(text).replace(/[&<>"']/g, function(char) {
+        return {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#039;"
+        }[char];
+      });
+    }
+
+    loadPlayers();
+  </script>
+
+</body>
+</html>
