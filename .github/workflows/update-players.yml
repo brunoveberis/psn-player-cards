@@ -22,10 +22,27 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
       - name: Read Exophase levels
         env:
           GOOGLE_SHEET_CSV_URL: ${{ secrets.GOOGLE_SHEET_CSV_URL }}
-        run: node scripts/players.js
+        run: npm run update
+
+      - name: Upload debugging information
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exophase-debug
+          path: |
+            debug-*.txt
+            debug-*.png
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Commit updated players.json
         run: |
