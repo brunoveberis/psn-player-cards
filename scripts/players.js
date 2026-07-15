@@ -1,4 +1,5 @@
 const fs = require("fs");
+const { chromium } = require("playwright");
 
 const csvUrl = process.env.GOOGLE_SHEET_CSV_URL;
 
@@ -7,21 +8,6 @@ if (!csvUrl) {
 }
 
 const OUTPUT_FILE = "players.json";
-
-const REQUEST_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-    "AppleWebKit/537.36 (KHTML, like Gecko) " +
-    "Chrome/126.0 Safari/537.36",
-
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9," +
-    "image/avif,image/webp,image/apng,*/*;q=0.8",
-
-  "Accept-Language": "en-US,en;q=0.9",
-  "Cache-Control": "no-cache",
-  Pragma: "no-cache"
-};
 
 function sleep(milliseconds) {
   return new Promise(function(resolve) {
@@ -71,11 +57,51 @@ function getProfileUrl(nickname) {
   );
 }
 
-function getCardUrl(nickname) {
+function getFallbackCardUrl(nickname) {
   return (
     "https://card.exophase.com/psn/" +
     encodeURIComponent(nickname) +
     ".png"
+  );
+}
+
+function extractCardUrl(text) {
+  if (!text) {
+    return "";
+  }
+
+  const patterns = [
+    /https:\/\/card\.exophase\.com\/[0-9]+\/[0-9]+\.png/gi,
+    /https:\/\/card\.exophase\.com\/psn\/[^"' <>\]]+\.png/gi
+  ];
+
+  for (const pattern of patterns) {
+    const match = String(text).match(pattern);
+
+    if (match && match[0]) {
+      return match[0]
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/g, "&");
+    }
+  }
+
+  return "";
+}
+
+function normalizeText(text) {
+  return String(text || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n")
+    .trim();
+}
+
+function isValidLevel(value) {
+  return (
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= 999
   );
 }
 
@@ -86,268 +112,91 @@ function escapeRegExp(value) {
   );
 }
 
-function decodeHtmlEntities(text) {
-  const namedEntities = {
-    amp: "&",
-    lt: "<",
-    gt: ">",
-    quot: '"',
-    apos: "'",
-    nbsp: " "
-  };
-
-  return String(text || "").replace(
-    /&(#x?[0-9a-f]+|amp|lt|gt|quot|apos|nbsp);/gi,
-    function(match, entity) {
-      const normalized = entity.toLowerCase();
-
-      if (
-        Object.prototype.hasOwnProperty.call(
-          namedEntities,
-          normalized
-        )
-      ) {
-        return namedEntities[normalized];
-      }
-
-      if (normalized.startsWith("#x")) {
-        const code = Number.parseInt(
-          normalized.slice(2),
-          16
-        );
-
-        return Number.isFinite(code)
-          ? String.fromCodePoint(code)
-          : " ";
-      }
-
-      if (normalized.startsWith("#")) {
-        const code = Number.parseInt(
-          normalized.slice(1),
-          10
-        );
-
-        return Number.isFinite(code)
-          ? String.fromCodePoint(code)
-          : " ";
-      }
-
-      return " ";
-    }
-  );
-}
-
-function htmlToText(html) {
-  return decodeHtmlEntities(
-    String(html || "")
-      .replace(/<!--[\s\S]*?-->/g, " ")
-      .replace(
-        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
-        " "
-      )
-      .replace(
-        /<style\b[^>]*>[\s\S]*?<\/style>/gi,
-        " "
-      )
-      .replace(
-        /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
-        " "
-      )
-      .replace(
-        /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
-        " "
-      )
-      .replace(/<br\s*\/?>/gi, " ")
-      .replace(/<\/(?:div|p|h1|h2|h3|li|section)>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-  )
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isValidLevel(level) {
-  return (
-    Number.isInteger(level) &&
-    level >= 1 &&
-    level <= 999
-  );
-}
-
-function extractLevelFromProfile(html, nickname) {
-  const text = htmlToText(html);
+function extractLevelFromVisibleText(text, nickname) {
+  const normalized = normalizeText(text);
   const escapedNickname = escapeRegExp(nickname);
 
   /*
-    Expected Exophase profile header:
+    Exophase header normally appears in this order:
 
-    nickname 316 20.38%
+    PikxelisLV
+    316
+    20.38%
 
-    Only allow a short distance between these values. This prevents
-    numbers such as "3,634 hours" from being mistaken for the level.
+    The whitespace can be spaces or line breaks.
   */
-  const exactHeaderPattern = new RegExp(
-    "(?:^|\\s)" +
-      escapedNickname +
-      "\\s+(\\d{1,3})\\s+" +
-      "(\\d{1,3}(?:[.,]\\d{1,2})?)%",
-    "ig"
+  const nicknamePattern = new RegExp(
+    escapedNickname +
+      "[\\s\\S]{0,120}?" +
+      "\\b([0-9]{1,3})\\b" +
+      "[\\s\\S]{0,50}?" +
+      "\\b[0-9]{1,3}(?:[.,][0-9]+)?%",
+    "i"
   );
 
-  const exactMatches = Array.from(
-    text.matchAll(exactHeaderPattern)
+  const nicknameMatch = normalized.match(
+    nicknamePattern
   );
 
-  for (const match of exactMatches) {
-    const level = Number.parseInt(match[1], 10);
+  if (nicknameMatch && nicknameMatch[1]) {
+    const level = Number.parseInt(
+      nicknameMatch[1],
+      10
+    );
 
     if (isValidLevel(level)) {
-      return {
-        level: level,
-        progress: match[2],
-        method: "exact-header"
-      };
+      return level;
     }
   }
 
   /*
-    Restricted fallback:
+    More restrictive line-based fallback.
 
-    Find every occurrence of the nickname. Examine no more than
-    100 characters after it. The first two values must be:
-
-    level percentage
+    Find the nickname line and inspect only the next few lines.
   */
-  const lowerText = text.toLowerCase();
-  const lowerNickname = nickname.toLowerCase();
+  const lines = normalized
+    .split("\n")
+    .map(function(line) {
+      return line.trim();
+    })
+    .filter(Boolean);
 
-  let searchPosition = 0;
-
-  while (searchPosition < lowerText.length) {
-    const nicknameIndex = lowerText.indexOf(
-      lowerNickname,
-      searchPosition
-    );
-
-    if (nicknameIndex === -1) {
-      break;
+  const nicknameIndex = lines.findIndex(
+    function(line) {
+      return (
+        line.toLowerCase() ===
+        nickname.toLowerCase()
+      );
     }
+  );
 
-    const afterNickname = text
+  if (nicknameIndex !== -1) {
+    const nearbyText = lines
       .slice(
-        nicknameIndex + nickname.length,
-        nicknameIndex + nickname.length + 100
+        nicknameIndex,
+        nicknameIndex + 8
       )
-      .trim();
+      .join(" ");
 
-    const localMatch = afterNickname.match(
-      /^(\d{1,3})\s+(\d{1,3}(?:[.,]\d{1,2})?)%/
+    const nearbyMatch = nearbyText.match(
+      new RegExp(
+        escapedNickname +
+          "\\s+(?:LVL\\s*)?" +
+          "([0-9]{1,3})\\s+" +
+          "[0-9]{1,3}(?:[.,][0-9]+)?%",
+        "i"
+      )
     );
 
-    if (localMatch) {
+    if (nearbyMatch && nearbyMatch[1]) {
       const level = Number.parseInt(
-        localMatch[1],
+        nearbyMatch[1],
         10
       );
 
       if (isValidLevel(level)) {
-        return {
-          level: level,
-          progress: localMatch[2],
-          method: "restricted-header"
-        };
+        return level;
       }
-    }
-
-    searchPosition =
-      nicknameIndex + nickname.length;
-  }
-
-  return {
-    level: 0,
-    progress: "",
-    method: "not-found"
-  };
-}
-
-async function fetchProfileHtml(nickname) {
-  const profileUrl = getProfileUrl(nickname);
-
-  const response = await fetch(
-    profileUrl + "?cache=" + Date.now(),
-    {
-      headers: REQUEST_HEADERS,
-      redirect: "follow"
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Exophase returned HTTP ${response.status}`
-    );
-  }
-
-  const contentType =
-    response.headers.get("content-type") || "";
-
-  if (
-    !contentType.toLowerCase().includes("text/html")
-  ) {
-    throw new Error(
-      `Unexpected content type: ${contentType}`
-    );
-  }
-
-  const html = await response.text();
-
-  if (!html || html.length < 500) {
-    throw new Error(
-      "Exophase returned an unexpectedly short page"
-    );
-  }
-
-  return html;
-}
-
-async function getPsnLevel(nickname) {
-  const maximumAttempts = 3;
-
-  for (
-    let attempt = 1;
-    attempt <= maximumAttempts;
-    attempt++
-  ) {
-    try {
-      const html = await fetchProfileHtml(
-        nickname
-      );
-
-      const result = extractLevelFromProfile(
-        html,
-        nickname
-      );
-
-      if (result.level > 0) {
-        console.log(
-          `${nickname}: level ${result.level}, ` +
-          `progress ${result.progress}%, ` +
-          `method ${result.method}`
-        );
-
-        return result.level;
-      }
-
-      console.log(
-        `${nickname}: profile header was not found`
-      );
-    } catch (error) {
-      console.log(
-        `${nickname}: attempt ${attempt} failed: ` +
-        error.message
-      );
-    }
-
-    if (attempt < maximumAttempts) {
-      await sleep(attempt * 1500);
     }
   }
 
@@ -356,8 +205,10 @@ async function getPsnLevel(nickname) {
 
 async function loadNamesFromSheet() {
   const response = await fetch(csvUrl, {
-    headers: REQUEST_HEADERS,
-    redirect: "follow"
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 PSN Player Cards Updater"
+    }
   });
 
   if (!response.ok) {
@@ -376,7 +227,7 @@ async function loadNamesFromSheet() {
 
   if (lines.length < 2) {
     throw new Error(
-      "Google Sheet does not contain player rows"
+      "Google Sheet does not contain any player rows"
     );
   }
 
@@ -413,36 +264,264 @@ function loadExistingPlayers() {
   }
 
   try {
-    const existing = JSON.parse(
-      fs.readFileSync(OUTPUT_FILE, "utf8")
+    const contents = fs.readFileSync(
+      OUTPUT_FILE,
+      "utf8"
     );
 
-    if (!Array.isArray(existing)) {
-      return new Map();
-    }
-
+    const players = JSON.parse(contents);
     const map = new Map();
 
-    existing.forEach(function(player) {
+    if (!Array.isArray(players)) {
+      return map;
+    }
+
+    for (const player of players) {
       if (!player || !player.name) {
-        return;
+        continue;
       }
 
       map.set(
         String(player.name).toLowerCase(),
         player
       );
-    });
+    }
 
     return map;
   } catch (error) {
     console.log(
-      `Could not read existing ${OUTPUT_FILE}: ` +
-      error.message
+      `Could not read existing players.json: ${error.message}`
     );
 
     return new Map();
   }
+}
+
+async function acceptCookieBanner(page) {
+  const buttonNames = [
+    /accept all/i,
+    /accept/i,
+    /agree/i,
+    /allow all/i
+  ];
+
+  for (const buttonName of buttonNames) {
+    const button = page
+      .getByRole("button", {
+        name: buttonName
+      })
+      .first();
+
+    try {
+      if (
+        await button.isVisible({
+          timeout: 1000
+        })
+      ) {
+        await button.click({
+          timeout: 3000
+        });
+
+        await page.waitForTimeout(500);
+
+        return;
+      }
+    } catch (error) {
+      // Banner was not present.
+    }
+  }
+}
+
+async function readPlayerProfile(
+  context,
+  nickname
+) {
+  const profileUrl = getProfileUrl(nickname);
+  const page = await context.newPage();
+
+  try {
+    console.log(
+      `${nickname}: opening ${profileUrl}`
+    );
+
+    const response = await page.goto(
+      profileUrl,
+      {
+        waitUntil: "domcontentloaded",
+        timeout: 60000
+      }
+    );
+
+    if (!response) {
+      throw new Error(
+        "Browser did not receive a response"
+      );
+    }
+
+    if (!response.ok()) {
+      throw new Error(
+        `Exophase returned HTTP ${response.status()}`
+      );
+    }
+
+    await acceptCookieBanner(page);
+
+    /*
+      Give Exophase client-side scripts time to populate
+      the visible profile header.
+    */
+    await page.waitForTimeout(2500);
+
+    await page
+      .locator("body")
+      .waitFor({
+        state: "visible",
+        timeout: 15000
+      });
+
+    const title = await page.title();
+    const visibleText = await page
+      .locator("body")
+      .innerText({
+        timeout: 15000
+      });
+
+    const normalizedText =
+      normalizeText(visibleText);
+
+    if (
+      /just a moment|checking your browser|verify you are human/i.test(
+        title + " " + normalizedText
+      )
+    ) {
+      throw new Error(
+        "Exophase displayed a browser verification page"
+      );
+    }
+
+    if (
+      /access denied|temporarily blocked|too many requests/i.test(
+        normalizedText
+      )
+    ) {
+      throw new Error(
+        "Exophase blocked the request"
+      );
+    }
+
+    const psnLevel =
+      extractLevelFromVisibleText(
+        normalizedText,
+        nickname
+      );
+
+    if (!psnLevel) {
+      const debugFile =
+        "debug-" +
+        nickname.replace(
+          /[^a-zA-Z0-9_-]/g,
+          "_"
+        ) +
+        ".txt";
+
+      fs.writeFileSync(
+        debugFile,
+        normalizedText,
+        "utf8"
+      );
+
+      await page.screenshot({
+        path:
+          "debug-" +
+          nickname.replace(
+            /[^a-zA-Z0-9_-]/g,
+            "_"
+          ) +
+          ".png",
+        fullPage: false
+      });
+
+      throw new Error(
+        "Could not find PSN level in visible profile text"
+      );
+    }
+
+    let cardUrl = "";
+
+    const pageHtml = await page.content();
+
+    cardUrl = extractCardUrl(pageHtml);
+
+    if (!cardUrl) {
+      const imageSources = await page
+        .locator("img")
+        .evaluateAll(function(images) {
+          return images
+            .map(function(image) {
+              return image.currentSrc || image.src || "";
+            })
+            .filter(Boolean);
+        });
+
+      cardUrl = imageSources.find(
+        function(source) {
+          return source.includes(
+            "card.exophase.com"
+          );
+        }
+      ) || "";
+    }
+
+    if (!cardUrl) {
+      cardUrl =
+        getFallbackCardUrl(nickname);
+    }
+
+    console.log(
+      `${nickname}: detected PSN level ${psnLevel}`
+    );
+
+    return {
+      level: psnLevel,
+      cardUrl: cardUrl
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+async function readPlayerWithRetries(
+  context,
+  nickname
+) {
+  const maximumAttempts = 3;
+
+  for (
+    let attempt = 1;
+    attempt <= maximumAttempts;
+    attempt++
+  ) {
+    try {
+      return await readPlayerProfile(
+        context,
+        nickname
+      );
+    } catch (error) {
+      console.log(
+        `${nickname}: attempt ${attempt} failed: ` +
+        error.message
+      );
+
+      if (attempt < maximumAttempts) {
+        await sleep(attempt * 3000);
+      }
+    }
+  }
+
+  return {
+    level: 0,
+    cardUrl: getFallbackCardUrl(nickname)
+  };
 }
 
 function sortPlayers(players) {
@@ -464,47 +543,7 @@ function sortPlayers(players) {
   });
 }
 
-async function runValidationCheck() {
-  console.log(
-    "Running Exophase parser validation..."
-  );
-
-  const validationNickname = "PikxelisLV";
-  const expectedLevel = 316;
-
-  const html = await fetchProfileHtml(
-    validationNickname
-  );
-
-  const result = extractLevelFromProfile(
-    html,
-    validationNickname
-  );
-
-  console.log(
-    `Validation result: ${validationNickname} ` +
-    `returned ${result.level}`
-  );
-
-  if (result.level !== expectedLevel) {
-    throw new Error(
-      "Validation failed. Expected PikxelisLV level " +
-      `${expectedLevel}, received ${result.level}. ` +
-      "players.json was not changed."
-    );
-  }
-
-  console.log("Validation passed.");
-}
-
 async function main() {
-  /*
-    Do not touch players.json unless the parser first proves
-    that it can read a known live profile correctly.
-  */
-  await runValidationCheck();
-
-  console.log("");
   console.log(
     "Loading player names from Google Sheets..."
   );
@@ -518,92 +557,115 @@ async function main() {
   const existingPlayers =
     loadExistingPlayers();
 
+  const browser = await chromium.launch({
+    headless: true
+  });
+
+  const context = await browser.newContext({
+    locale: "en-US",
+
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/131.0.0.0 Safari/537.36",
+
+    viewport: {
+      width: 1440,
+      height: 1000
+    },
+
+    extraHTTPHeaders: {
+      "Accept-Language": "en-US,en;q=0.9"
+    }
+  });
+
   const players = [];
   let detectedCount = 0;
-  let failedCount = 0;
 
-  for (const nickname of names) {
-    console.log("");
-    console.log(`Processing ${nickname}...`);
-
-    const detectedLevel =
-      await getPsnLevel(nickname);
-
-    let psnLevel = detectedLevel;
-
-    if (detectedLevel > 0) {
-      detectedCount++;
-    } else {
-      failedCount++;
-
-      const previousPlayer =
-        existingPlayers.get(
-          nickname.toLowerCase()
-        );
-
-      /*
-        Reuse an old value only when it looks realistic.
-
-        Values below 50 are not reused because the previous OCR
-        script filled many profiles with fragments such as 2, 3,
-        5, 8, 10, 23 and 33.
-      */
-      const previousLevel = Number(
-        previousPlayer &&
-        previousPlayer.psnLevel
+  try {
+    for (const nickname of names) {
+      console.log("");
+      console.log(
+        `Processing ${nickname}...`
       );
 
-      if (
-        Number.isInteger(previousLevel) &&
-        previousLevel >= 50 &&
-        previousLevel <= 999
-      ) {
-        psnLevel = previousLevel;
-
-        console.log(
-          `${nickname}: using previous reliable ` +
-          `level ${previousLevel}`
+      const result =
+        await readPlayerWithRetries(
+          context,
+          nickname
         );
+
+      let psnLevel = result.level;
+
+      if (psnLevel > 0) {
+        detectedCount++;
       } else {
-        psnLevel = 0;
+        const existingPlayer =
+          existingPlayers.get(
+            nickname.toLowerCase()
+          );
 
-        console.log(
-          `${nickname}: no reliable level available`
+        const oldLevel = Number(
+          existingPlayer &&
+          existingPlayer.psnLevel
         );
+
+        /*
+          Preserve the old value only if it looks plausible.
+
+          Do not reuse the corrupted small OCR values that were
+          previously written as 2, 3, 5 and similar.
+        */
+        if (
+          Number.isInteger(oldLevel) &&
+          oldLevel >= 100 &&
+          oldLevel <= 999
+        ) {
+          psnLevel = oldLevel;
+
+          console.log(
+            `${nickname}: using previous level ${oldLevel}`
+          );
+        }
       }
+
+      players.push({
+        name: nickname,
+        profileUrl: getProfileUrl(
+          nickname
+        ),
+        cardUrl: result.cardUrl,
+        psnLevel: psnLevel
+      });
+
+      /*
+        Keep the requests slow and sequential.
+      */
+      await sleep(2500);
     }
-
-    players.push({
-      name: nickname,
-      profileUrl: getProfileUrl(nickname),
-      cardUrl: getCardUrl(nickname),
-      psnLevel: psnLevel
-    });
-
-    await sleep(1000);
+  } finally {
+    await context.close();
+    await browser.close();
   }
 
   console.log("");
   console.log(
-    `Detected levels: ${detectedCount}`
-  );
-
-  console.log(
-    `Undetected profiles: ${failedCount}`
+    `Successfully detected ${detectedCount} of ${names.length} levels.`
   );
 
   /*
-    If Exophase blocks most requests or changes its page,
-    stop instead of publishing a broken alphabetical ranking.
+    Do not replace players.json if browser access failed
+    for most players.
   */
-  const requiredSuccessCount = Math.ceil(
-    names.length * 0.75
+  const minimumDetected = Math.ceil(
+    names.length * 0.7
   );
 
-  if (detectedCount < requiredSuccessCount) {
+  if (detectedCount < minimumDetected) {
     throw new Error(
       `Only ${detectedCount} of ${names.length} levels ` +
-      "were detected. players.json was not overwritten."
+      "were detected. players.json was not overwritten. " +
+      "Check the debug files in the workflow artifacts."
     );
   }
 
