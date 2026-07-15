@@ -1,6 +1,4 @@
 const fs = require("fs");
-const sharp = require("sharp");
-const { createWorker, PSM } = require("tesseract.js");
 
 const csvUrl = process.env.GOOGLE_SHEET_CSV_URL;
 
@@ -11,8 +9,14 @@ if (!csvUrl) {
 const OUTPUT_FILE = "players.json";
 
 const REQUEST_HEADERS = {
-  "User-Agent": "Mozilla/5.0 GitHubAction PSN Player Cards",
-  Accept: "image/png,image/*;q=0.9,text/html;q=0.8,*/*;q=0.5"
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/126.0 Safari/537.36",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9," +
+    "image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9"
 };
 
 function parseCsvLine(line) {
@@ -57,7 +61,7 @@ function getProfileUrl(nickname) {
   );
 }
 
-function getFallbackCardUrl(nickname) {
+function getCardUrl(nickname) {
   return (
     "https://card.exophase.com/psn/" +
     encodeURIComponent(nickname) +
@@ -65,450 +69,288 @@ function getFallbackCardUrl(nickname) {
   );
 }
 
-function extractCardUrl(text) {
-  if (!text) {
-    return "";
-  }
-
-  const patterns = [
-    /https:\/\/card\.exophase\.com\/[0-9]+\/[0-9]+\.png/g,
-    /https:\/\/card\.exophase\.com\/psn\/[^"' <>\]]+\.png/g,
-    /https:\\\/\\\/card\.exophase\.com\\\/[0-9]+\\\/[0-9]+\.png/g,
-    /https:\\\/\\\/card\.exophase\.com\\\/psn\\\/[^"' <>\]]+\.png/g
-  ];
-
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-
-    if (match && match[0]) {
-      return match[0]
-        .replace(/\\\//g, "/")
-        .replace(/&amp;/g, "&");
-    }
-  }
-
-  return "";
+function sleep(milliseconds) {
+  return new Promise(function(resolve) {
+    setTimeout(resolve, milliseconds);
+  });
 }
 
-async function tryGetGeneratedCardUrl(nickname) {
-  const body = new URLSearchParams();
+function decodeHtmlEntities(text) {
+  const namedEntities = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " "
+  };
 
-  body.set("top_platform", "psn");
-  body.set("top_gamertag", nickname);
-  body.set("top_show", "games");
-  body.set("bottom_platform", "");
-  body.set("bottom_gamertag", "");
-  body.set("bottom_show", "games");
+  return String(text || "")
+    .replace(
+      /&(#x?[0-9a-f]+|amp|lt|gt|quot|apos|nbsp);/gi,
+      function(match, entity) {
+        const lowerEntity = entity.toLowerCase();
 
-  const response = await fetch(
-    "https://gamercards.exophase.com/",
-    {
-      method: "POST",
-      headers: {
-        ...REQUEST_HEADERS,
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: body.toString()
-    }
+        if (namedEntities[lowerEntity] !== undefined) {
+          return namedEntities[lowerEntity];
+        }
+
+        if (lowerEntity.startsWith("#x")) {
+          const code = Number.parseInt(
+            lowerEntity.slice(2),
+            16
+          );
+
+          return Number.isFinite(code)
+            ? String.fromCodePoint(code)
+            : " ";
+        }
+
+        if (lowerEntity.startsWith("#")) {
+          const code = Number.parseInt(
+            lowerEntity.slice(1),
+            10
+          );
+
+          return Number.isFinite(code)
+            ? String.fromCodePoint(code)
+            : " ";
+        }
+
+        return " ";
+      }
+    );
+}
+
+function htmlToVisibleText(html) {
+  return decodeHtmlEntities(
+    String(html || "")
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+      .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
+      .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
+}
+
+function isValidPsnLevel(value) {
+  return (
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= 999
+  );
+}
+
+function extractPsnLevel(html, nickname) {
+  const visibleText = htmlToVisibleText(html);
+  const escapedNickname = escapeRegExp(nickname);
+
+  /*
+    Exophase profile header text appears in this order:
+
+    nickname
+    PSN trophy level
+    progress percentage
+
+    Example:
+    PikxelisLV 316 20.38%
+  */
+  const nicknamePattern = new RegExp(
+    "(?:^|\\s)" +
+      escapedNickname +
+      "\\s+(\\d{1,3})\\s+" +
+      "\\d{1,3}(?:[.,]\\d+)?%",
+    "i"
   );
 
-  if (!response.ok) {
-    throw new Error(
-      `Card generator returned HTTP ${response.status}`
+  const nicknameMatch = visibleText.match(
+    nicknamePattern
+  );
+
+  if (nicknameMatch && nicknameMatch[1]) {
+    const level = Number.parseInt(
+      nicknameMatch[1],
+      10
     );
+
+    if (isValidPsnLevel(level)) {
+      return level;
+    }
   }
 
-  return extractCardUrl(await response.text());
+  /*
+    Fallback for minor Exophase layout changes.
+
+    Locate the first percentage after the player's name,
+    then inspect the short section immediately before it.
+  */
+  const lowerText = visibleText.toLowerCase();
+  const lowerNickname = nickname.toLowerCase();
+
+  const nicknameIndex =
+    lowerText.indexOf(lowerNickname);
+
+  if (nicknameIndex !== -1) {
+    const textAfterNickname = visibleText.slice(
+      nicknameIndex + nickname.length
+    );
+
+    const percentageMatch =
+      textAfterNickname.match(
+        /\d{1,3}(?:[.,]\d+)?%/
+      );
+
+    if (percentageMatch && percentageMatch.index !== undefined) {
+      const beforePercentage = textAfterNickname
+        .slice(0, percentageMatch.index)
+        .trim();
+
+      const numberMatches =
+        beforePercentage.match(/\b\d{1,3}\b/g);
+
+      if (numberMatches && numberMatches.length) {
+        const lastNumber =
+          numberMatches[numberMatches.length - 1];
+
+        const level = Number.parseInt(
+          lastNumber,
+          10
+        );
+
+        if (isValidPsnLevel(level)) {
+          return level;
+        }
+      }
+    }
+  }
+
+  /*
+    Final fallback.
+
+    The first standalone level followed by a percentage
+    in the visible profile text is normally the profile header.
+  */
+  const generalMatch = visibleText.match(
+    /\b(\d{1,3})\s+\d{1,3}(?:[.,]\d+)?%/
+  );
+
+  if (generalMatch && generalMatch[1]) {
+    const level = Number.parseInt(
+      generalMatch[1],
+      10
+    );
+
+    if (isValidPsnLevel(level)) {
+      return level;
+    }
+  }
+
+  return 0;
 }
 
-async function tryGetCardFromProfilePage(nickname) {
-  const response = await fetch(getProfileUrl(nickname), {
-    headers: REQUEST_HEADERS
+async function fetchProfileHtml(nickname) {
+  const profileUrl = getProfileUrl(nickname);
+
+  const response = await fetch(profileUrl, {
+    headers: REQUEST_HEADERS,
+    redirect: "follow"
   });
 
   if (!response.ok) {
     throw new Error(
-      `Profile returned HTTP ${response.status}`
-    );
-  }
-
-  return extractCardUrl(await response.text());
-}
-
-async function getBestCardUrl(nickname) {
-  try {
-    const generatedCardUrl =
-      await tryGetGeneratedCardUrl(nickname);
-
-    if (generatedCardUrl) {
-      console.log(
-        `Generated card for ${nickname}: ${generatedCardUrl}`
-      );
-
-      return generatedCardUrl;
-    }
-  } catch (error) {
-    console.log(
-      `Generator failed for ${nickname}: ${error.message}`
-    );
-  }
-
-  try {
-    const profileCardUrl =
-      await tryGetCardFromProfilePage(nickname);
-
-    if (profileCardUrl) {
-      console.log(
-        `Profile card for ${nickname}: ${profileCardUrl}`
-      );
-
-      return profileCardUrl;
-    }
-  } catch (error) {
-    console.log(
-      `Profile scan failed for ${nickname}: ${error.message}`
-    );
-  }
-
-  const fallbackUrl = getFallbackCardUrl(nickname);
-
-  console.log(
-    `Using fallback card for ${nickname}: ${fallbackUrl}`
-  );
-
-  return fallbackUrl;
-}
-
-async function downloadCard(cardUrl) {
-  const separator = cardUrl.includes("?") ? "&" : "?";
-
-  const response = await fetch(
-    cardUrl + separator + "cache=" + Date.now(),
-    {
-      headers: REQUEST_HEADERS
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Card returned HTTP ${response.status}`
+      `Exophase returned HTTP ${response.status}`
     );
   }
 
   const contentType =
     response.headers.get("content-type") || "";
 
-  if (!contentType.toLowerCase().includes("image")) {
-    throw new Error(
-      `Card response was not an image: ${contentType}`
-    );
-  }
-
-  return Buffer.from(await response.arrayBuffer());
-}
-
-function getScaledLevelCrop(imageWidth, imageHeight) {
-  /*
-    Reference card dimensions: 425 x 142.
-
-    Exact level-number area:
-    x = 214 through 250
-    y = 5 through 35
-
-    This excludes the yellow icon and the trophy total.
-  */
-
-  const scaleX = imageWidth / 425;
-  const scaleY = imageHeight / 142;
-
-  const left = Math.round(214 * scaleX);
-  const top = Math.round(5 * scaleY);
-  const right = Math.round(250 * scaleX);
-  const bottom = Math.round(35 * scaleY);
-
-  return {
-    left: Math.max(0, left),
-    top: Math.max(0, top),
-    width: Math.max(
-      1,
-      Math.min(imageWidth - left, right - left)
-    ),
-    height: Math.max(
-      1,
-      Math.min(imageHeight - top, bottom - top)
-    )
-  };
-}
-
-async function createLevelImages(cardBuffer) {
-  const metadata = await sharp(cardBuffer).metadata();
-
-  if (!metadata.width || !metadata.height) {
-    throw new Error("Could not determine card dimensions");
-  }
-
-  const crop = getScaledLevelCrop(
-    metadata.width,
-    metadata.height
-  );
-
-  console.log(
-    `Card: ${metadata.width}x${metadata.height}`
-  );
-
-  console.log(
-    `Crop: x=${crop.left}, y=${crop.top}, ` +
-    `width=${crop.width}, height=${crop.height}`
-  );
-
-  /*
-    Keep the original aspect ratio.
-
-    The earlier code stretched and heavily transformed the crop,
-    which caused partial numbers and false readings.
-  */
-  const enlargedWidth = crop.width * 12;
-  const enlargedHeight = crop.height * 12;
-
-  const padding = {
-    top: 60,
-    bottom: 60,
-    left: 60,
-    right: 60,
-    background: "white"
-  };
-
-  const original = await sharp(cardBuffer)
-    .extract(crop)
-    .resize({
-      width: enlargedWidth,
-      height: enlargedHeight,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  const grayscale = await sharp(cardBuffer)
-    .extract(crop)
-    .resize({
-      width: enlargedWidth,
-      height: enlargedHeight,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  const threshold140 = await sharp(cardBuffer)
-    .extract(crop)
-    .resize({
-      width: enlargedWidth,
-      height: enlargedHeight,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .threshold(140)
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  const threshold170 = await sharp(cardBuffer)
-    .extract(crop)
-    .resize({
-      width: enlargedWidth,
-      height: enlargedHeight,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .threshold(170)
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  return [
-    {
-      name: "original",
-      buffer: original
-    },
-    {
-      name: "grayscale",
-      buffer: grayscale
-    },
-    {
-      name: "threshold-140",
-      buffer: threshold140
-    },
-    {
-      name: "threshold-170",
-      buffer: threshold170
-    }
-  ];
-}
-
-function parseLevel(text) {
-  const digits = String(text || "")
-    .replace(/\s+/g, "")
-    .replace(/[^0-9]/g, "");
-
-  if (!/^\d{1,3}$/.test(digits)) {
-    return 0;
-  }
-
-  const level = Number.parseInt(digits, 10);
-
   if (
-    !Number.isInteger(level) ||
-    level < 1 ||
-    level > 999
+    !contentType
+      .toLowerCase()
+      .includes("text/html")
   ) {
-    return 0;
-  }
-
-  return level;
-}
-
-async function recognizeLevelImage(
-  worker,
-  levelImage,
-  nickname
-) {
-  const result = await worker.recognize(
-    levelImage.buffer
-  );
-
-  const rawText =
-    String(result.data.text || "").trim();
-
-  const level = parseLevel(rawText);
-
-  const confidence =
-    Number(result.data.confidence || 0);
-
-  console.log(
-    `${nickname} ${levelImage.name}: ` +
-    `"${rawText}" => ${level || "none"} ` +
-    `(confidence ${confidence.toFixed(1)})`
-  );
-
-  return {
-    level: level,
-    confidence: confidence
-  };
-}
-
-function selectLevel(results) {
-  const valid = results.filter(function(result) {
-    return (
-      Number.isInteger(result.level) &&
-      result.level >= 1 &&
-      result.level <= 999
+    throw new Error(
+      `Unexpected response type: ${contentType}`
     );
-  });
-
-  if (!valid.length) {
-    return 0;
   }
 
-  const grouped = new Map();
+  return response.text();
+}
 
-  for (const result of valid) {
-    if (!grouped.has(result.level)) {
-      grouped.set(result.level, {
-        level: result.level,
-        votes: 0,
-        confidence: 0
-      });
-    }
+async function fetchPsnLevel(nickname) {
+  const maximumAttempts = 3;
 
-    const candidate = grouped.get(result.level);
+  for (
+    let attempt = 1;
+    attempt <= maximumAttempts;
+    attempt++
+  ) {
+    try {
+      const html = await fetchProfileHtml(
+        nickname
+      );
 
-    candidate.votes++;
-    candidate.confidence += result.confidence;
-  }
+      const level = extractPsnLevel(
+        html,
+        nickname
+      );
 
-  const candidates = Array.from(
-    grouped.values()
-  ).sort(function(a, b) {
-    if (b.votes !== a.votes) {
-      return b.votes - a.votes;
-    }
-
-    return b.confidence - a.confidence;
-  });
-
-  console.log(
-    "Candidates: " +
-    candidates
-      .map(function(candidate) {
-        return (
-          candidate.level +
-          " (" +
-          candidate.votes +
-          " votes)"
+      if (level > 0) {
+        console.log(
+          `${nickname}: detected PSN level ${level}`
         );
-      })
-      .join(", ")
-  );
 
-  const best = candidates[0];
+        return level;
+      }
 
-  /*
-    At least two independent image versions must agree.
+      const visibleText =
+        htmlToVisibleText(html);
 
-    A single incorrect reading is saved as 0 instead of damaging
-    the complete ranking.
-  */
-  if (best.votes >= 2) {
-    return best.level;
+      if (
+        /private|no games have been played/i.test(
+          visibleText
+        )
+      ) {
+        console.log(
+          `${nickname}: profile is private or empty`
+        );
+
+        return 0;
+      }
+
+      throw new Error(
+        "PSN level was not found in profile page"
+      );
+    } catch (error) {
+      console.log(
+        `${nickname}: attempt ${attempt} failed: ` +
+        error.message
+      );
+
+      if (attempt < maximumAttempts) {
+        await sleep(attempt * 1500);
+      }
+    }
   }
 
   return 0;
 }
 
-async function readPsnLevel(
-  cardBuffer,
-  worker,
-  nickname
-) {
-  const levelImages =
-    await createLevelImages(cardBuffer);
-
-  const results = [];
-
-  for (const levelImage of levelImages) {
-    try {
-      const result =
-        await recognizeLevelImage(
-          worker,
-          levelImage,
-          nickname
-        );
-
-      results.push(result);
-    } catch (error) {
-      console.log(
-        `OCR failed for ${nickname} ` +
-        `${levelImage.name}: ${error.message}`
-      );
-    }
-  }
-
-  return selectLevel(results);
-}
-
 async function loadNamesFromSheet() {
   const response = await fetch(csvUrl, {
-    headers: REQUEST_HEADERS
+    headers: REQUEST_HEADERS,
+    redirect: "follow"
   });
 
   if (!response.ok) {
@@ -571,15 +413,9 @@ function sortPlayers(players) {
   });
 }
 
-function sleep(milliseconds) {
-  return new Promise(function(resolve) {
-    setTimeout(resolve, milliseconds);
-  });
-}
-
 async function main() {
   console.log(
-    "Loading players from Google Sheets..."
+    "Loading player names from Google Sheets..."
   );
 
   const names = await loadNamesFromSheet();
@@ -588,59 +424,26 @@ async function main() {
     `Found ${names.length} unique players.`
   );
 
-  const worker = await createWorker("eng");
-
-  await worker.setParameters({
-    tessedit_char_whitelist: "0123456789",
-    tessedit_pageseg_mode: PSM.SINGLE_LINE,
-    preserve_interword_spaces: "0",
-    user_defined_dpi: "300"
-  });
-
   const players = [];
 
-  try {
-    for (const nickname of names) {
-      console.log("");
-      console.log(`Processing ${nickname}...`);
+  for (const nickname of names) {
+    console.log("");
+    console.log(`Processing ${nickname}...`);
 
-      const cardUrl =
-        await getBestCardUrl(nickname);
+    const psnLevel =
+      await fetchPsnLevel(nickname);
 
-      let psnLevel = 0;
+    players.push({
+      name: nickname,
+      profileUrl: getProfileUrl(nickname),
+      cardUrl: getCardUrl(nickname),
+      psnLevel: psnLevel
+    });
 
-      try {
-        const cardBuffer =
-          await downloadCard(cardUrl);
-
-        psnLevel = await readPsnLevel(
-          cardBuffer,
-          worker,
-          nickname
-        );
-      } catch (error) {
-        console.log(
-          `Could not read ${nickname}: ` +
-          error.message
-        );
-      }
-
-      players.push({
-        name: nickname,
-        profileUrl: getProfileUrl(nickname),
-        cardUrl: cardUrl,
-        psnLevel: psnLevel
-      });
-
-      console.log(
-        `Final PSN level for ` +
-        `${nickname}: ${psnLevel}`
-      );
-
-      await sleep(800);
-    }
-  } finally {
-    await worker.terminate();
+    /*
+      Avoid sending all profile requests at once.
+    */
+    await sleep(1000);
   }
 
   sortPlayers(players);
