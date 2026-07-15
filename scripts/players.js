@@ -13,11 +13,21 @@ const REQUEST_HEADERS = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
     "Chrome/126.0 Safari/537.36",
+
   Accept:
     "text/html,application/xhtml+xml,application/xml;q=0.9," +
     "image/avif,image/webp,image/apng,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9"
+
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache"
 };
+
+function sleep(milliseconds) {
+  return new Promise(function(resolve) {
+    setTimeout(resolve, milliseconds);
+  });
+}
 
 function parseCsvLine(line) {
   const result = [];
@@ -69,10 +79,11 @@ function getCardUrl(nickname) {
   );
 }
 
-function sleep(milliseconds) {
-  return new Promise(function(resolve) {
-    setTimeout(resolve, milliseconds);
-  });
+function escapeRegExp(value) {
+  return String(value).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
 }
 
 function decodeHtmlEntities(text) {
@@ -85,186 +96,189 @@ function decodeHtmlEntities(text) {
     nbsp: " "
   };
 
-  return String(text || "")
-    .replace(
-      /&(#x?[0-9a-f]+|amp|lt|gt|quot|apos|nbsp);/gi,
-      function(match, entity) {
-        const lowerEntity = entity.toLowerCase();
+  return String(text || "").replace(
+    /&(#x?[0-9a-f]+|amp|lt|gt|quot|apos|nbsp);/gi,
+    function(match, entity) {
+      const normalized = entity.toLowerCase();
 
-        if (namedEntities[lowerEntity] !== undefined) {
-          return namedEntities[lowerEntity];
-        }
-
-        if (lowerEntity.startsWith("#x")) {
-          const code = Number.parseInt(
-            lowerEntity.slice(2),
-            16
-          );
-
-          return Number.isFinite(code)
-            ? String.fromCodePoint(code)
-            : " ";
-        }
-
-        if (lowerEntity.startsWith("#")) {
-          const code = Number.parseInt(
-            lowerEntity.slice(1),
-            10
-          );
-
-          return Number.isFinite(code)
-            ? String.fromCodePoint(code)
-            : " ";
-        }
-
-        return " ";
+      if (
+        Object.prototype.hasOwnProperty.call(
+          namedEntities,
+          normalized
+        )
+      ) {
+        return namedEntities[normalized];
       }
-    );
+
+      if (normalized.startsWith("#x")) {
+        const code = Number.parseInt(
+          normalized.slice(2),
+          16
+        );
+
+        return Number.isFinite(code)
+          ? String.fromCodePoint(code)
+          : " ";
+      }
+
+      if (normalized.startsWith("#")) {
+        const code = Number.parseInt(
+          normalized.slice(1),
+          10
+        );
+
+        return Number.isFinite(code)
+          ? String.fromCodePoint(code)
+          : " ";
+      }
+
+      return " ";
+    }
+  );
 }
 
-function htmlToVisibleText(html) {
+function htmlToText(html) {
   return decodeHtmlEntities(
     String(html || "")
       .replace(/<!--[\s\S]*?-->/g, " ")
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-      .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
-      .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
+      .replace(
+        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+        " "
+      )
+      .replace(
+        /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+        " "
+      )
+      .replace(
+        /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+        " "
+      )
+      .replace(
+        /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
+        " "
+      )
+      .replace(/<br\s*\/?>/gi, " ")
+      .replace(/<\/(?:div|p|h1|h2|h3|li|section)>/gi, " ")
       .replace(/<[^>]+>/g, " ")
   )
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(
-    /[.*+?^${}()|[\]\\]/g,
-    "\\$&"
-  );
-}
-
-function isValidPsnLevel(value) {
+function isValidLevel(level) {
   return (
-    Number.isInteger(value) &&
-    value >= 1 &&
-    value <= 999
+    Number.isInteger(level) &&
+    level >= 1 &&
+    level <= 999
   );
 }
 
-function extractPsnLevel(html, nickname) {
-  const visibleText = htmlToVisibleText(html);
+function extractLevelFromProfile(html, nickname) {
+  const text = htmlToText(html);
   const escapedNickname = escapeRegExp(nickname);
 
   /*
-    Exophase profile header text appears in this order:
+    Expected Exophase profile header:
 
-    nickname
-    PSN trophy level
-    progress percentage
+    nickname 316 20.38%
 
-    Example:
-    PikxelisLV 316 20.38%
+    Only allow a short distance between these values. This prevents
+    numbers such as "3,634 hours" from being mistaken for the level.
   */
-  const nicknamePattern = new RegExp(
+  const exactHeaderPattern = new RegExp(
     "(?:^|\\s)" +
       escapedNickname +
       "\\s+(\\d{1,3})\\s+" +
-      "\\d{1,3}(?:[.,]\\d+)?%",
-    "i"
+      "(\\d{1,3}(?:[.,]\\d{1,2})?)%",
+    "ig"
   );
 
-  const nicknameMatch = visibleText.match(
-    nicknamePattern
+  const exactMatches = Array.from(
+    text.matchAll(exactHeaderPattern)
   );
 
-  if (nicknameMatch && nicknameMatch[1]) {
-    const level = Number.parseInt(
-      nicknameMatch[1],
-      10
-    );
+  for (const match of exactMatches) {
+    const level = Number.parseInt(match[1], 10);
 
-    if (isValidPsnLevel(level)) {
-      return level;
+    if (isValidLevel(level)) {
+      return {
+        level: level,
+        progress: match[2],
+        method: "exact-header"
+      };
     }
   }
 
   /*
-    Fallback for minor Exophase layout changes.
+    Restricted fallback:
 
-    Locate the first percentage after the player's name,
-    then inspect the short section immediately before it.
+    Find every occurrence of the nickname. Examine no more than
+    100 characters after it. The first two values must be:
+
+    level percentage
   */
-  const lowerText = visibleText.toLowerCase();
+  const lowerText = text.toLowerCase();
   const lowerNickname = nickname.toLowerCase();
 
-  const nicknameIndex =
-    lowerText.indexOf(lowerNickname);
+  let searchPosition = 0;
 
-  if (nicknameIndex !== -1) {
-    const textAfterNickname = visibleText.slice(
-      nicknameIndex + nickname.length
+  while (searchPosition < lowerText.length) {
+    const nicknameIndex = lowerText.indexOf(
+      lowerNickname,
+      searchPosition
     );
 
-    const percentageMatch =
-      textAfterNickname.match(
-        /\d{1,3}(?:[.,]\d+)?%/
+    if (nicknameIndex === -1) {
+      break;
+    }
+
+    const afterNickname = text
+      .slice(
+        nicknameIndex + nickname.length,
+        nicknameIndex + nickname.length + 100
+      )
+      .trim();
+
+    const localMatch = afterNickname.match(
+      /^(\d{1,3})\s+(\d{1,3}(?:[.,]\d{1,2})?)%/
+    );
+
+    if (localMatch) {
+      const level = Number.parseInt(
+        localMatch[1],
+        10
       );
 
-    if (percentageMatch && percentageMatch.index !== undefined) {
-      const beforePercentage = textAfterNickname
-        .slice(0, percentageMatch.index)
-        .trim();
-
-      const numberMatches =
-        beforePercentage.match(/\b\d{1,3}\b/g);
-
-      if (numberMatches && numberMatches.length) {
-        const lastNumber =
-          numberMatches[numberMatches.length - 1];
-
-        const level = Number.parseInt(
-          lastNumber,
-          10
-        );
-
-        if (isValidPsnLevel(level)) {
-          return level;
-        }
+      if (isValidLevel(level)) {
+        return {
+          level: level,
+          progress: localMatch[2],
+          method: "restricted-header"
+        };
       }
     }
+
+    searchPosition =
+      nicknameIndex + nickname.length;
   }
 
-  /*
-    Final fallback.
-
-    The first standalone level followed by a percentage
-    in the visible profile text is normally the profile header.
-  */
-  const generalMatch = visibleText.match(
-    /\b(\d{1,3})\s+\d{1,3}(?:[.,]\d+)?%/
-  );
-
-  if (generalMatch && generalMatch[1]) {
-    const level = Number.parseInt(
-      generalMatch[1],
-      10
-    );
-
-    if (isValidPsnLevel(level)) {
-      return level;
-    }
-  }
-
-  return 0;
+  return {
+    level: 0,
+    progress: "",
+    method: "not-found"
+  };
 }
 
 async function fetchProfileHtml(nickname) {
   const profileUrl = getProfileUrl(nickname);
 
-  const response = await fetch(profileUrl, {
-    headers: REQUEST_HEADERS,
-    redirect: "follow"
-  });
+  const response = await fetch(
+    profileUrl + "?cache=" + Date.now(),
+    {
+      headers: REQUEST_HEADERS,
+      redirect: "follow"
+    }
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -276,19 +290,25 @@ async function fetchProfileHtml(nickname) {
     response.headers.get("content-type") || "";
 
   if (
-    !contentType
-      .toLowerCase()
-      .includes("text/html")
+    !contentType.toLowerCase().includes("text/html")
   ) {
     throw new Error(
-      `Unexpected response type: ${contentType}`
+      `Unexpected content type: ${contentType}`
     );
   }
 
-  return response.text();
+  const html = await response.text();
+
+  if (!html || html.length < 500) {
+    throw new Error(
+      "Exophase returned an unexpectedly short page"
+    );
+  }
+
+  return html;
 }
 
-async function fetchPsnLevel(nickname) {
+async function getPsnLevel(nickname) {
   const maximumAttempts = 3;
 
   for (
@@ -301,46 +321,33 @@ async function fetchPsnLevel(nickname) {
         nickname
       );
 
-      const level = extractPsnLevel(
+      const result = extractLevelFromProfile(
         html,
         nickname
       );
 
-      if (level > 0) {
+      if (result.level > 0) {
         console.log(
-          `${nickname}: detected PSN level ${level}`
+          `${nickname}: level ${result.level}, ` +
+          `progress ${result.progress}%, ` +
+          `method ${result.method}`
         );
 
-        return level;
+        return result.level;
       }
 
-      const visibleText =
-        htmlToVisibleText(html);
-
-      if (
-        /private|no games have been played/i.test(
-          visibleText
-        )
-      ) {
-        console.log(
-          `${nickname}: profile is private or empty`
-        );
-
-        return 0;
-      }
-
-      throw new Error(
-        "PSN level was not found in profile page"
+      console.log(
+        `${nickname}: profile header was not found`
       );
     } catch (error) {
       console.log(
         `${nickname}: attempt ${attempt} failed: ` +
         error.message
       );
+    }
 
-      if (attempt < maximumAttempts) {
-        await sleep(attempt * 1500);
-      }
+    if (attempt < maximumAttempts) {
+      await sleep(attempt * 1500);
     }
   }
 
@@ -366,6 +373,12 @@ async function loadNamesFromSheet() {
     .filter(function(line) {
       return line.trim() !== "";
     });
+
+  if (lines.length < 2) {
+    throw new Error(
+      "Google Sheet does not contain player rows"
+    );
+  }
 
   const rows = lines
     .slice(1)
@@ -394,6 +407,44 @@ async function loadNamesFromSheet() {
   return names;
 }
 
+function loadExistingPlayers() {
+  if (!fs.existsSync(OUTPUT_FILE)) {
+    return new Map();
+  }
+
+  try {
+    const existing = JSON.parse(
+      fs.readFileSync(OUTPUT_FILE, "utf8")
+    );
+
+    if (!Array.isArray(existing)) {
+      return new Map();
+    }
+
+    const map = new Map();
+
+    existing.forEach(function(player) {
+      if (!player || !player.name) {
+        return;
+      }
+
+      map.set(
+        String(player.name).toLowerCase(),
+        player
+      );
+    });
+
+    return map;
+  } catch (error) {
+    console.log(
+      `Could not read existing ${OUTPUT_FILE}: ` +
+      error.message
+    );
+
+    return new Map();
+  }
+}
+
 function sortPlayers(players) {
   players.sort(function(a, b) {
     const levelA = Number(a.psnLevel || 0);
@@ -413,7 +464,47 @@ function sortPlayers(players) {
   });
 }
 
+async function runValidationCheck() {
+  console.log(
+    "Running Exophase parser validation..."
+  );
+
+  const validationNickname = "PikxelisLV";
+  const expectedLevel = 316;
+
+  const html = await fetchProfileHtml(
+    validationNickname
+  );
+
+  const result = extractLevelFromProfile(
+    html,
+    validationNickname
+  );
+
+  console.log(
+    `Validation result: ${validationNickname} ` +
+    `returned ${result.level}`
+  );
+
+  if (result.level !== expectedLevel) {
+    throw new Error(
+      "Validation failed. Expected PikxelisLV level " +
+      `${expectedLevel}, received ${result.level}. ` +
+      "players.json was not changed."
+    );
+  }
+
+  console.log("Validation passed.");
+}
+
 async function main() {
+  /*
+    Do not touch players.json unless the parser first proves
+    that it can read a known live profile correctly.
+  */
+  await runValidationCheck();
+
+  console.log("");
   console.log(
     "Loading player names from Google Sheets..."
   );
@@ -424,14 +515,63 @@ async function main() {
     `Found ${names.length} unique players.`
   );
 
+  const existingPlayers =
+    loadExistingPlayers();
+
   const players = [];
+  let detectedCount = 0;
+  let failedCount = 0;
 
   for (const nickname of names) {
     console.log("");
     console.log(`Processing ${nickname}...`);
 
-    const psnLevel =
-      await fetchPsnLevel(nickname);
+    const detectedLevel =
+      await getPsnLevel(nickname);
+
+    let psnLevel = detectedLevel;
+
+    if (detectedLevel > 0) {
+      detectedCount++;
+    } else {
+      failedCount++;
+
+      const previousPlayer =
+        existingPlayers.get(
+          nickname.toLowerCase()
+        );
+
+      /*
+        Reuse an old value only when it looks realistic.
+
+        Values below 50 are not reused because the previous OCR
+        script filled many profiles with fragments such as 2, 3,
+        5, 8, 10, 23 and 33.
+      */
+      const previousLevel = Number(
+        previousPlayer &&
+        previousPlayer.psnLevel
+      );
+
+      if (
+        Number.isInteger(previousLevel) &&
+        previousLevel >= 50 &&
+        previousLevel <= 999
+      ) {
+        psnLevel = previousLevel;
+
+        console.log(
+          `${nickname}: using previous reliable ` +
+          `level ${previousLevel}`
+        );
+      } else {
+        psnLevel = 0;
+
+        console.log(
+          `${nickname}: no reliable level available`
+        );
+      }
+    }
 
     players.push({
       name: nickname,
@@ -440,18 +580,47 @@ async function main() {
       psnLevel: psnLevel
     });
 
-    /*
-      Avoid sending all profile requests at once.
-    */
     await sleep(1000);
+  }
+
+  console.log("");
+  console.log(
+    `Detected levels: ${detectedCount}`
+  );
+
+  console.log(
+    `Undetected profiles: ${failedCount}`
+  );
+
+  /*
+    If Exophase blocks most requests or changes its page,
+    stop instead of publishing a broken alphabetical ranking.
+  */
+  const requiredSuccessCount = Math.ceil(
+    names.length * 0.75
+  );
+
+  if (detectedCount < requiredSuccessCount) {
+    throw new Error(
+      `Only ${detectedCount} of ${names.length} levels ` +
+      "were detected. players.json was not overwritten."
+    );
   }
 
   sortPlayers(players);
 
+  const temporaryFile =
+    OUTPUT_FILE + ".tmp";
+
   fs.writeFileSync(
-    OUTPUT_FILE,
+    temporaryFile,
     JSON.stringify(players, null, 2),
     "utf8"
+  );
+
+  fs.renameSync(
+    temporaryFile,
+    OUTPUT_FILE
   );
 
   console.log("");
@@ -473,6 +642,8 @@ async function main() {
 }
 
 main().catch(function(error) {
-  console.error(error);
+  console.error("");
+  console.error("Update failed:");
+  console.error(error.message);
   process.exit(1);
 });
