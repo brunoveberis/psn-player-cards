@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "update": "node scripts/players.js"
+    "update": "node scripts/players.js",
+    "refresh-cards": "node scripts/refresh-card-urls.js"
   },
   "dependencies": {
-    "playwright": "1.55.0"
+    "playwright": "^1.55.0"
   }
 }
