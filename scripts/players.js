@@ -8,6 +8,11 @@ if (!csvUrl) {
   throw new Error("Missing GOOGLE_SHEET_CSV_URL");
 }
 
+const REQUEST_HEADERS = {
+  "User-Agent": "Mozilla/5.0 GitHubAction PSN Player Cards",
+  Accept: "image/png,image/*;q=0.9,text/html;q=0.8,*/*;q=0.5"
+};
+
 function parseCsvLine(line) {
   const result = [];
   let current = "";
@@ -84,7 +89,6 @@ function extractCardUrl(text) {
 }
 
 async function tryGetGeneratedCardUrl(nickname) {
-  const formUrl = "https://gamercards.exophase.com/";
   const body = new URLSearchParams();
 
   body.set("top_platform", "psn");
@@ -94,14 +98,17 @@ async function tryGetGeneratedCardUrl(nickname) {
   body.set("bottom_gamertag", "");
   body.set("bottom_show", "games");
 
-  const response = await fetch(formUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": "Mozilla/5.0 GitHubAction PSN Player Cards"
-    },
-    body: body.toString()
-  });
+  const response = await fetch(
+    "https://gamercards.exophase.com/",
+    {
+      method: "POST",
+      headers: {
+        ...REQUEST_HEADERS,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: body.toString()
+    }
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -109,40 +116,34 @@ async function tryGetGeneratedCardUrl(nickname) {
     );
   }
 
-  const text = await response.text();
-
-  return extractCardUrl(text);
+  return extractCardUrl(await response.text());
 }
 
 async function tryGetCardFromProfilePage(nickname) {
   const response = await fetch(getProfileUrl(nickname), {
-    headers: {
-      "User-Agent": "Mozilla/5.0 GitHubAction PSN Player Cards"
-    }
+    headers: REQUEST_HEADERS
   });
 
   if (!response.ok) {
     throw new Error(
-      `Profile page returned HTTP ${response.status}`
+      `Profile returned HTTP ${response.status}`
     );
   }
 
-  const text = await response.text();
-
-  return extractCardUrl(text);
+  return extractCardUrl(await response.text());
 }
 
 async function getBestCardUrl(nickname) {
   try {
-    const generatedCardUrl =
+    const generatedUrl =
       await tryGetGeneratedCardUrl(nickname);
 
-    if (generatedCardUrl) {
+    if (generatedUrl) {
       console.log(
-        `Generated card URL for ${nickname}: ${generatedCardUrl}`
+        `Generated card for ${nickname}: ${generatedUrl}`
       );
 
-      return generatedCardUrl;
+      return generatedUrl;
     }
   } catch (error) {
     console.log(
@@ -151,15 +152,15 @@ async function getBestCardUrl(nickname) {
   }
 
   try {
-    const profileCardUrl =
+    const profileUrl =
       await tryGetCardFromProfilePage(nickname);
 
-    if (profileCardUrl) {
+    if (profileUrl) {
       console.log(
-        `Profile card URL for ${nickname}: ${profileCardUrl}`
+        `Profile card for ${nickname}: ${profileUrl}`
       );
 
-      return profileCardUrl;
+      return profileUrl;
     }
   } catch (error) {
     console.log(
@@ -167,50 +168,42 @@ async function getBestCardUrl(nickname) {
     );
   }
 
-  const fallback = getFallbackCardUrl(nickname);
-
-  console.log(
-    `Using fallback card URL for ${nickname}: ${fallback}`
-  );
-
-  return fallback;
+  return getFallbackCardUrl(nickname);
 }
 
-async function downloadImage(imageUrl) {
+async function downloadImage(url) {
+  const separator = url.includes("?") ? "&" : "?";
+
   const response = await fetch(
-    imageUrl + (imageUrl.includes("?") ? "&" : "?") + "cache=" + Date.now(),
+    url + separator + "cache=" + Date.now(),
     {
-      headers: {
-        "User-Agent": "Mozilla/5.0 GitHubAction PSN Player Cards",
-        "Accept": "image/png,image/*;q=0.8,*/*;q=0.5"
-      }
+      headers: REQUEST_HEADERS
     }
   );
 
   if (!response.ok) {
     throw new Error(
-      `Card image returned HTTP ${response.status}`
+      `Card returned HTTP ${response.status}`
     );
   }
 
   const contentType =
     response.headers.get("content-type") || "";
 
-  if (!contentType.includes("image")) {
+  if (!contentType.toLowerCase().includes("image")) {
     throw new Error(
-      `Card response was not an image: ${contentType}`
+      `Card response is not an image: ${contentType}`
     );
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-
-  return Buffer.from(arrayBuffer);
+  return Buffer.from(await response.arrayBuffer());
 }
 
-function cleanOcrNumber(text) {
+function cleanRecognizedLevel(text) {
   const cleaned = String(text || "")
-    .replace(/[Oo]/g, "0")
-    .replace(/[Il|]/g, "1")
+    .replace(/[OoQ]/g, "0")
+    .replace(/[Il|!]/g, "1")
+    .replace(/[Zz]/g, "2")
     .replace(/[Ss]/g, "5")
     .replace(/[Bb]/g, "8")
     .replace(/[^0-9]/g, "");
@@ -219,233 +212,335 @@ function cleanOcrNumber(text) {
     return 0;
   }
 
-  const number = Number.parseInt(cleaned, 10);
+  const level = Number.parseInt(cleaned, 10);
 
   if (
-    !Number.isInteger(number) ||
-    number < 1 ||
-    number > 999
+    !Number.isInteger(level) ||
+    level < 1 ||
+    level > 999
   ) {
     return 0;
   }
 
-  return number;
+  return level;
 }
 
-async function makeLevelImages(cardBuffer) {
+function createCropRegions(width, height) {
+  /*
+    The PSN trophy level is at the upper-left of the card.
+
+    The star icon sits first, and the number is immediately to
+    its right. These regions deliberately exclude most of the
+    star so OCR sees only the level number.
+
+    Several nearby regions are tested because Exophase cards
+    can have slightly different dimensions or layouts.
+  */
+  return [
+    {
+      name: "level-main",
+      left: 0.105,
+      top: 0.025,
+      width: 0.165,
+      height: 0.17
+    },
+    {
+      name: "level-wide",
+      left: 0.09,
+      top: 0.015,
+      width: 0.21,
+      height: 0.19
+    },
+    {
+      name: "level-lower",
+      left: 0.105,
+      top: 0.045,
+      width: 0.17,
+      height: 0.17
+    },
+    {
+      name: "level-narrow",
+      left: 0.12,
+      top: 0.025,
+      width: 0.145,
+      height: 0.16
+    }
+  ].map(function(region) {
+    const left = Math.max(
+      0,
+      Math.round(width * region.left)
+    );
+
+    const top = Math.max(
+      0,
+      Math.round(height * region.top)
+    );
+
+    const cropWidth = Math.max(
+      25,
+      Math.min(
+        width - left,
+        Math.round(width * region.width)
+      )
+    );
+
+    const cropHeight = Math.max(
+      18,
+      Math.min(
+        height - top,
+        Math.round(height * region.height)
+      )
+    );
+
+    return {
+      name: region.name,
+      left: left,
+      top: top,
+      width: cropWidth,
+      height: cropHeight
+    };
+  });
+}
+
+async function createOcrImages(cardBuffer) {
   const metadata = await sharp(cardBuffer).metadata();
 
   if (!metadata.width || !metadata.height) {
     throw new Error("Could not determine card dimensions");
   }
 
-  /*
-    The PSN trophy level is located inside the large circle
-    near the upper-left corner of the Exophase card.
-
-    The crop uses percentages so it works with cards rendered
-    at different resolutions.
-  */
-  const left = Math.max(
-    0,
-    Math.round(metadata.width * 0.045)
+  console.log(
+    `Card dimensions: ${metadata.width}x${metadata.height}`
   );
 
-  const top = Math.max(
-    0,
-    Math.round(metadata.height * 0.095)
+  const regions = createCropRegions(
+    metadata.width,
+    metadata.height
   );
 
-  const width = Math.min(
-    metadata.width - left,
-    Math.max(40, Math.round(metadata.width * 0.14))
-  );
+  const images = [];
 
-  const height = Math.min(
-    metadata.height - top,
-    Math.max(30, Math.round(metadata.height * 0.23))
-  );
+  for (const region of regions) {
+    const crop = sharp(cardBuffer).extract({
+      left: region.left,
+      top: region.top,
+      width: region.width,
+      height: region.height
+    });
 
-  const crop = sharp(cardBuffer).extract({
-    left: left,
-    top: top,
-    width: width,
-    height: height
-  });
+    const outputWidth = Math.max(
+      500,
+      region.width * 8
+    );
 
-  const normal = await crop
-    .clone()
-    .resize({
-      width: width * 10,
-      height: height * 10,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .png()
-    .toBuffer();
+    const normal = await crop
+      .clone()
+      .resize({
+        width: outputWidth,
+        withoutEnlargement: false,
+        kernel: sharp.kernel.lanczos3
+      })
+      .grayscale()
+      .normalize()
+      .sharpen()
+      .png()
+      .toBuffer();
 
-  const threshold120 = await crop
-    .clone()
-    .resize({
-      width: width * 10,
-      height: height * 10,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .threshold(120)
-    .png()
-    .toBuffer();
+    const threshold150 = await crop
+      .clone()
+      .resize({
+        width: outputWidth,
+        withoutEnlargement: false,
+        kernel: sharp.kernel.lanczos3
+      })
+      .grayscale()
+      .normalize()
+      .sharpen()
+      .threshold(150)
+      .png()
+      .toBuffer();
 
-  const threshold150 = await crop
-    .clone()
-    .resize({
-      width: width * 10,
-      height: height * 10,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .threshold(150)
-    .png()
-    .toBuffer();
+    const threshold180 = await crop
+      .clone()
+      .resize({
+        width: outputWidth,
+        withoutEnlargement: false,
+        kernel: sharp.kernel.lanczos3
+      })
+      .grayscale()
+      .normalize()
+      .sharpen()
+      .threshold(180)
+      .png()
+      .toBuffer();
 
-  const threshold180 = await crop
-    .clone()
-    .resize({
-      width: width * 10,
-      height: height * 10,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .threshold(180)
-    .png()
-    .toBuffer();
+    const inverted = await crop
+      .clone()
+      .resize({
+        width: outputWidth,
+        withoutEnlargement: false,
+        kernel: sharp.kernel.lanczos3
+      })
+      .grayscale()
+      .normalize()
+      .negate()
+      .sharpen()
+      .threshold(150)
+      .png()
+      .toBuffer();
 
-  const inverted = await crop
-    .clone()
-    .resize({
-      width: width * 10,
-      height: height * 10,
-      fit: "fill",
-      kernel: sharp.kernel.lanczos3
-    })
-    .grayscale()
-    .normalize()
-    .negate()
-    .sharpen()
-    .threshold(150)
-    .png()
-    .toBuffer();
+    images.push({
+      name: region.name + "-normal",
+      buffer: normal
+    });
 
-  return [
-    normal,
-    threshold120,
-    threshold150,
-    threshold180,
-    inverted
-  ];
-}
+    images.push({
+      name: region.name + "-threshold-150",
+      buffer: threshold150
+    });
 
-async function readPsnLevel(cardBuffer, worker, nickname) {
-  const levelImages = await makeLevelImages(cardBuffer);
-  const candidates = [];
+    images.push({
+      name: region.name + "-threshold-180",
+      buffer: threshold180
+    });
 
-  for (let index = 0; index < levelImages.length; index++) {
-    try {
-      const result = await worker.recognize(levelImages[index]);
-      const text = result.data.text || "";
-      const level = cleanOcrNumber(text);
-      const confidence = Number(result.data.confidence || 0);
-
-      console.log(
-        `OCR attempt ${index + 1} for ${nickname}: ` +
-        `"${text.trim()}" => ${level || "not found"} ` +
-        `(confidence ${confidence.toFixed(1)})`
-      );
-
-      if (level > 0) {
-        candidates.push({
-          level: level,
-          confidence: confidence
-        });
-      }
-    } catch (error) {
-      console.log(
-        `OCR attempt ${index + 1} failed for ${nickname}: ` +
-        error.message
-      );
-    }
+    images.push({
+      name: region.name + "-inverted",
+      buffer: inverted
+    });
   }
 
-  if (!candidates.length) {
+  return images;
+}
+
+async function recognizeImage(worker, image, nickname) {
+  const result = await worker.recognize(image.buffer);
+
+  const rawText = String(result.data.text || "").trim();
+  const level = cleanRecognizedLevel(rawText);
+  const confidence = Number(result.data.confidence || 0);
+
+  console.log(
+    `${nickname} ${image.name}: ` +
+    `"${rawText}" => ${level || "none"} ` +
+    `(confidence ${confidence.toFixed(1)})`
+  );
+
+  return {
+    level: level,
+    confidence: confidence,
+    region: image.name
+  };
+}
+
+function chooseBestLevel(results) {
+  const validResults = results.filter(function(result) {
+    return result.level >= 1 && result.level <= 999;
+  });
+
+  if (!validResults.length) {
     return 0;
   }
 
-  /*
-    Prefer a number detected by multiple preprocessing attempts.
-    When frequencies are equal, use the highest OCR confidence.
-  */
   const grouped = new Map();
 
-  for (const candidate of candidates) {
-    if (!grouped.has(candidate.level)) {
-      grouped.set(candidate.level, {
-        level: candidate.level,
+  for (const result of validResults) {
+    if (!grouped.has(result.level)) {
+      grouped.set(result.level, {
+        level: result.level,
         count: 0,
+        totalConfidence: 0,
         bestConfidence: 0
       });
     }
 
-    const item = grouped.get(candidate.level);
+    const group = grouped.get(result.level);
 
-    item.count++;
-    item.bestConfidence = Math.max(
-      item.bestConfidence,
-      candidate.confidence
+    group.count++;
+    group.totalConfidence += result.confidence;
+    group.bestConfidence = Math.max(
+      group.bestConfidence,
+      result.confidence
     );
   }
 
-  const rankedCandidates = Array.from(grouped.values())
+  const ranked = Array.from(grouped.values())
     .sort(function(a, b) {
       if (b.count !== a.count) {
         return b.count - a.count;
       }
 
+      if (b.totalConfidence !== a.totalConfidence) {
+        return b.totalConfidence - a.totalConfidence;
+      }
+
       return b.bestConfidence - a.bestConfidence;
     });
 
-  return rankedCandidates[0].level;
+  /*
+    Require either:
+    1. The same result from at least two OCR attempts, or
+    2. One unusually confident result.
+
+    This prevents random trophy counts or visual fragments
+    from being stored as the player's PSN level.
+  */
+  const best = ranked[0];
+
+  if (
+    best.count >= 2 ||
+    best.bestConfidence >= 75
+  ) {
+    return best.level;
+  }
+
+  return 0;
 }
 
-function sleep(ms) {
+async function readPsnLevel(
+  cardBuffer,
+  worker,
+  nickname
+) {
+  const images = await createOcrImages(cardBuffer);
+  const results = [];
+
+  for (const image of images) {
+    try {
+      const result = await recognizeImage(
+        worker,
+        image,
+        nickname
+      );
+
+      if (result.level > 0) {
+        results.push(result);
+      }
+    } catch (error) {
+      console.log(
+        `OCR failed for ${nickname} ` +
+        `${image.name}: ${error.message}`
+      );
+    }
+  }
+
+  return chooseBestLevel(results);
+}
+
+function sleep(milliseconds) {
   return new Promise(function(resolve) {
-    setTimeout(resolve, ms);
+    setTimeout(resolve, milliseconds);
   });
 }
 
-async function main() {
-  console.log("Loading player names from Google Sheets...");
-
+async function loadNamesFromSheet() {
   const response = await fetch(csvUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 GitHubAction PSN Player Cards"
-    }
+    headers: REQUEST_HEADERS
   });
 
   if (!response.ok) {
     throw new Error(
-      `Failed to fetch Google Sheet: HTTP ${response.status}`
+      `Google Sheet returned HTTP ${response.status}`
     );
   }
 
@@ -461,8 +556,8 @@ async function main() {
     .slice(1)
     .map(parseCsvLine);
 
-  const seen = new Set();
   const names = [];
+  const seen = new Set();
 
   for (const row of rows) {
     const nickname = cleanNickname(row[1]);
@@ -481,64 +576,10 @@ async function main() {
     names.push(nickname);
   }
 
-  console.log(`Found ${names.length} unique players.`);
+  return names;
+}
 
-  const worker = await createWorker("eng");
-
-  await worker.setParameters({
-    tessedit_char_whitelist: "0123456789",
-    tessedit_pageseg_mode: PSM.SINGLE_WORD,
-    preserve_interword_spaces: "0"
-  });
-
-  const players = [];
-
-  try {
-    for (const nickname of names) {
-      console.log("");
-      console.log(`Processing ${nickname}...`);
-
-      const cardUrl = await getBestCardUrl(nickname);
-
-      let psnLevel = 0;
-
-      try {
-        const cardBuffer = await downloadImage(cardUrl);
-
-        psnLevel = await readPsnLevel(
-          cardBuffer,
-          worker,
-          nickname
-        );
-      } catch (error) {
-        console.log(
-          `Could not read card for ${nickname}: ${error.message}`
-        );
-      }
-
-      players.push({
-        name: nickname,
-        profileUrl: getProfileUrl(nickname),
-        cardUrl: cardUrl,
-        psnLevel: psnLevel
-      });
-
-      if (psnLevel > 0) {
-        console.log(
-          `Detected PSN level for ${nickname}: ${psnLevel}`
-        );
-      } else {
-        console.log(
-          `PSN level could not be detected for ${nickname}`
-        );
-      }
-
-      await sleep(1000);
-    }
-  } finally {
-    await worker.terminate();
-  }
-
+function sortPlayers(players) {
   players.sort(function(a, b) {
     const levelA = Number(a.psnLevel || 0);
     const levelB = Number(b.psnLevel || 0);
@@ -555,6 +596,72 @@ async function main() {
       }
     );
   });
+}
+
+async function main() {
+  console.log("Loading names from Google Sheets...");
+
+  const names = await loadNamesFromSheet();
+
+  console.log(`Found ${names.length} unique players.`);
+
+  const worker = await createWorker("eng");
+
+  await worker.setParameters({
+    tessedit_char_whitelist: "0123456789",
+    tessedit_pageseg_mode: PSM.SINGLE_LINE,
+    preserve_interword_spaces: "0",
+    user_defined_dpi: "300"
+  });
+
+  const players = [];
+
+  try {
+    for (const nickname of names) {
+      console.log("");
+      console.log(`Processing ${nickname}...`);
+
+      const cardUrl = await getBestCardUrl(nickname);
+      let psnLevel = 0;
+
+      try {
+        const cardBuffer = await downloadImage(cardUrl);
+
+        psnLevel = await readPsnLevel(
+          cardBuffer,
+          worker,
+          nickname
+        );
+      } catch (error) {
+        console.log(
+          `Could not process ${nickname}: ${error.message}`
+        );
+      }
+
+      players.push({
+        name: nickname,
+        profileUrl: getProfileUrl(nickname),
+        cardUrl: cardUrl,
+        psnLevel: psnLevel
+      });
+
+      if (psnLevel > 0) {
+        console.log(
+          `Final PSN level for ${nickname}: ${psnLevel}`
+        );
+      } else {
+        console.log(
+          `PSN level not detected for ${nickname}`
+        );
+      }
+
+      await sleep(1000);
+    }
+  } finally {
+    await worker.terminate();
+  }
+
+  sortPlayers(players);
 
   fs.writeFileSync(
     "players.json",
