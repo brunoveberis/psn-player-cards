@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Generate players.json
+      - name: Read Exophase levels
         env:
           GOOGLE_SHEET_CSV_URL: ${{ secrets.GOOGLE_SHEET_CSV_URL }}
         run: node scripts/players.js
