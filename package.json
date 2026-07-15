@@ -1,0 +1,11 @@
+{
+  "name": "psn-player-cards",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "update": "node scripts/players.js"
+  },
+  "dependencies": {
+    "playwright": "1.55.0"
+  }
+}
