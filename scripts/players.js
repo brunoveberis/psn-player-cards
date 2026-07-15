@@ -206,22 +206,33 @@ async function downloadImage(url) {
     );
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-
-  return Buffer.from(arrayBuffer);
+  return Buffer.from(await response.arrayBuffer());
 }
 
-function cleanRecognizedLevel(text) {
-  const source = String(text || "")
+function normalizeOcrText(text) {
+  return String(text || "")
     .replace(/[OoQ]/g, "0")
     .replace(/[Il|!]/g, "1")
     .replace(/[Zz]/g, "2")
     .replace(/[Ss]/g, "5")
-    .replace(/[Bb]/g, "8");
+    .replace(/[Bb]/g, "8")
+    .replace(/[^0-9]/g, "");
+}
 
-  const matches = source.match(/\d{1,3}/g);
+function parseLevel(text) {
+  const digits = normalizeOcrText(text);
 
-  if (!matches || !matches.length) {
+  if (!digits) {
+    return 0;
+  }
+
+  /*
+    The crop should contain only the level. If OCR produces extra
+    digits, take the first plausible group of up to three digits.
+  */
+  const matches = digits.match(/[0-9]{1,3}/g);
+
+  if (!matches) {
     return 0;
   }
 
@@ -240,54 +251,61 @@ function cleanRecognizedLevel(text) {
   return 0;
 }
 
-function getLevelCropRegions(imageWidth, imageHeight) {
+function createLevelRegions(imageWidth, imageHeight) {
   /*
-    The PSN trophy level appears in the top bar, slightly right
-    of the horizontal center of the Exophase card.
+    The level number sits immediately to the right of the yellow
+    trophy-level icon.
 
-    These crops focus on the number to the right of the yellow
-    trophy-level icon. They avoid the username, trophy total,
-    games total and progress percentage.
+    These narrow regions deliberately start after the icon.
+    The previous versions started too far left and OCR interpreted
+    the icon itself as numbers such as 3, 5, 7, 41 or 74.
   */
-  const percentageRegions = [
+  const regions = [
     {
-      name: "main",
-      left: 0.505,
-      top: 0.035,
-      width: 0.105,
-      height: 0.19
+      name: "exact",
+      left: 0.542,
+      top: 0.055,
+      width: 0.075,
+      height: 0.125
     },
     {
-      name: "slightly-left",
-      left: 0.485,
-      top: 0.025,
-      width: 0.13,
-      height: 0.21
+      name: "left-2",
+      left: 0.536,
+      top: 0.055,
+      width: 0.082,
+      height: 0.125
     },
     {
-      name: "slightly-right",
-      left: 0.52,
-      top: 0.025,
-      width: 0.10,
-      height: 0.21
+      name: "right-2",
+      left: 0.548,
+      top: 0.055,
+      width: 0.072,
+      height: 0.125
     },
     {
-      name: "wide",
-      left: 0.475,
-      top: 0.015,
-      width: 0.16,
-      height: 0.23
+      name: "higher",
+      left: 0.542,
+      top: 0.042,
+      width: 0.078,
+      height: 0.14
     },
     {
       name: "lower",
-      left: 0.50,
-      top: 0.055,
-      width: 0.12,
-      height: 0.18
+      left: 0.542,
+      top: 0.065,
+      width: 0.078,
+      height: 0.125
+    },
+    {
+      name: "slightly-wide",
+      left: 0.532,
+      top: 0.045,
+      width: 0.09,
+      height: 0.145
     }
   ];
 
-  return percentageRegions.map(function(region) {
+  return regions.map(function(region) {
     const left = Math.max(
       0,
       Math.round(imageWidth * region.left)
@@ -307,7 +325,7 @@ function getLevelCropRegions(imageWidth, imageHeight) {
     );
 
     const height = Math.max(
-      18,
+      16,
       Math.min(
         imageHeight - top,
         Math.round(imageHeight * region.height)
@@ -324,7 +342,7 @@ function getLevelCropRegions(imageWidth, imageHeight) {
   });
 }
 
-async function createOcrImages(cardBuffer) {
+async function makeOcrVariants(cardBuffer) {
   const metadata = await sharp(cardBuffer).metadata();
 
   if (!metadata.width || !metadata.height) {
@@ -335,15 +353,15 @@ async function createOcrImages(cardBuffer) {
     `Card dimensions: ${metadata.width}x${metadata.height}`
   );
 
-  const cropRegions = getLevelCropRegions(
+  const regions = createLevelRegions(
     metadata.width,
     metadata.height
   );
 
-  const images = [];
+  const variants = [];
 
-  for (const region of cropRegions) {
-    const crop = sharp(cardBuffer).extract({
+  for (const region of regions) {
+    const baseCrop = sharp(cardBuffer).extract({
       left: region.left,
       top: region.top,
       width: region.width,
@@ -351,39 +369,11 @@ async function createOcrImages(cardBuffer) {
     });
 
     const targetWidth = Math.max(
-      700,
-      region.width * 12
+      600,
+      region.width * 14
     );
 
-    const normal = await crop
-      .clone()
-      .resize({
-        width: targetWidth,
-        kernel: sharp.kernel.lanczos3
-      })
-      .grayscale()
-      .normalize()
-      .sharpen({
-        sigma: 1.5
-      })
-      .png()
-      .toBuffer();
-
-    const contrast = await crop
-      .clone()
-      .resize({
-        width: targetWidth,
-        kernel: sharp.kernel.lanczos3
-      })
-      .grayscale()
-      .linear(2.5, -100)
-      .sharpen({
-        sigma: 1.5
-      })
-      .png()
-      .toBuffer();
-
-    const threshold130 = await crop
+    const normal = await baseCrop
       .clone()
       .resize({
         width: targetWidth,
@@ -392,11 +382,23 @@ async function createOcrImages(cardBuffer) {
       .grayscale()
       .normalize()
       .sharpen()
-      .threshold(130)
       .png()
       .toBuffer();
 
-    const threshold160 = await crop
+    const highContrast = await baseCrop
+      .clone()
+      .resize({
+        width: targetWidth,
+        kernel: sharp.kernel.lanczos3
+      })
+      .grayscale()
+      .normalize()
+      .linear(2.2, -90)
+      .sharpen()
+      .png()
+      .toBuffer();
+
+    const threshold140 = await baseCrop
       .clone()
       .resize({
         width: targetWidth,
@@ -405,11 +407,11 @@ async function createOcrImages(cardBuffer) {
       .grayscale()
       .normalize()
       .sharpen()
-      .threshold(160)
+      .threshold(140)
       .png()
       .toBuffer();
 
-    const threshold190 = await crop
+    const threshold170 = await baseCrop
       .clone()
       .resize({
         width: targetWidth,
@@ -418,11 +420,24 @@ async function createOcrImages(cardBuffer) {
       .grayscale()
       .normalize()
       .sharpen()
-      .threshold(190)
+      .threshold(170)
       .png()
       .toBuffer();
 
-    const inverted = await crop
+    const threshold200 = await baseCrop
+      .clone()
+      .resize({
+        width: targetWidth,
+        kernel: sharp.kernel.lanczos3
+      })
+      .grayscale()
+      .normalize()
+      .sharpen()
+      .threshold(200)
+      .png()
+      .toBuffer();
+
+    const inverted = await baseCrop
       .clone()
       .resize({
         width: targetWidth,
@@ -432,70 +447,70 @@ async function createOcrImages(cardBuffer) {
       .normalize()
       .negate()
       .sharpen()
-      .threshold(150)
+      .threshold(155)
       .png()
       .toBuffer();
 
-    images.push({
+    variants.push({
       name: region.name + "-normal",
       buffer: normal
     });
 
-    images.push({
+    variants.push({
       name: region.name + "-contrast",
-      buffer: contrast
+      buffer: highContrast
     });
 
-    images.push({
-      name: region.name + "-threshold-130",
-      buffer: threshold130
+    variants.push({
+      name: region.name + "-threshold-140",
+      buffer: threshold140
     });
 
-    images.push({
-      name: region.name + "-threshold-160",
-      buffer: threshold160
+    variants.push({
+      name: region.name + "-threshold-170",
+      buffer: threshold170
     });
 
-    images.push({
-      name: region.name + "-threshold-190",
-      buffer: threshold190
+    variants.push({
+      name: region.name + "-threshold-200",
+      buffer: threshold200
     });
 
-    images.push({
+    variants.push({
       name: region.name + "-inverted",
       buffer: inverted
     });
   }
 
-  return images;
+  return variants;
 }
 
-async function recognizeOcrImage(
+async function recognizeVariant(
   worker,
-  image,
+  variant,
   nickname
 ) {
-  const result = await worker.recognize(image.buffer);
+  const result = await worker.recognize(variant.buffer);
 
-  const text = String(result.data.text || "").trim();
-  const level = cleanRecognizedLevel(text);
+  const rawText = String(result.data.text || "").trim();
+  const level = parseLevel(rawText);
   const confidence = Number(result.data.confidence || 0);
 
   console.log(
-    `${nickname} ${image.name}: ` +
-    `"${text}" => ${level || "none"} ` +
+    `${nickname} ${variant.name}: ` +
+    `"${rawText}" => ${level || "none"} ` +
     `(confidence ${confidence.toFixed(1)})`
   );
 
   return {
     level: level,
     confidence: confidence,
-    imageName: image.name
+    variantName: variant.name
   };
 }
 
 function chooseBestLevel(results) {
-  const validResults = results.filter(function(result) {
+  const valid = results.filter(function(result) {
     return (
       Number.isInteger(result.level) &&
       result.level >= 1 &&
@@ -503,75 +518,90 @@ function chooseBestLevel(results) {
     );
   });
 
-  if (!validResults.length) {
+  if (!valid.length) {
     return 0;
   }
 
-  const groups = new Map();
+  const grouped = new Map();
 
-  for (const result of validResults) {
-    if (!groups.has(result.level)) {
-      groups.set(result.level, {
+  for (const result of valid) {
+    if (!grouped.has(result.level)) {
+      grouped.set(result.level, {
         level: result.level,
         count: 0,
-        confidenceTotal: 0,
-        highestConfidence: 0
+        totalConfidence: 0,
+        bestConfidence: 0,
+        threeDigitBonus: result.level >= 100 ? 1 : 0
       });
     }
 
-    const group = groups.get(result.level);
+    const group = grouped.get(result.level);
 
     group.count++;
-    group.confidenceTotal += result.confidence;
-    group.highestConfidence = Math.max(
-      group.highestConfidence,
+    group.totalConfidence += result.confidence;
+    group.bestConfidence = Math.max(
+      group.bestConfidence,
       result.confidence
     );
   }
 
-  const rankedGroups = Array.from(groups.values())
+  const ranked = Array.from(grouped.values())
     .sort(function(a, b) {
+      /*
+        Agreement between multiple crops is the strongest signal.
+      */
       if (b.count !== a.count) {
         return b.count - a.count;
       }
 
-      if (
-        b.confidenceTotal !== a.confidenceTotal
-      ) {
-        return (
-          b.confidenceTotal -
-          a.confidenceTotal
-        );
+      /*
+        When OCR sees both a complete three-digit number and a
+        fragment such as 5 or 74, prefer the complete result.
+      */
+      if (b.threeDigitBonus !== a.threeDigitBonus) {
+        return b.threeDigitBonus - a.threeDigitBonus;
       }
 
-      if (
-        b.highestConfidence !==
-        a.highestConfidence
-      ) {
-        return (
-          b.highestConfidence -
-          a.highestConfidence
-        );
+      if (b.totalConfidence !== a.totalConfidence) {
+        return b.totalConfidence - a.totalConfidence;
+      }
+
+      if (b.bestConfidence !== a.bestConfidence) {
+        return b.bestConfidence - a.bestConfidence;
       }
 
       return b.level - a.level;
     });
 
-  const best = rankedGroups[0];
+  console.log("OCR candidates:");
 
-  console.log(
-    `Best OCR candidate: ${best.level}, ` +
-    `${best.count} matches, ` +
-    `best confidence ${best.highestConfidence.toFixed(1)}`
-  );
+  ranked.forEach(function(candidate) {
+    console.log(
+      `  ${candidate.level}: ` +
+      `${candidate.count} matches, ` +
+      `total confidence ${candidate.totalConfidence.toFixed(1)}, ` +
+      `best confidence ${candidate.bestConfidence.toFixed(1)}`
+    );
+  });
+
+  const best = ranked[0];
 
   /*
-    Accept the result when multiple image treatments agree,
-    or when one result has high confidence.
+    Require agreement from at least two image variants.
+
+    A single OCR guess is not safe enough for ranking because
+    a trophy icon or background texture can look like a digit.
+  */
+  if (best.count >= 2) {
+    return best.level;
+  }
+
+  /*
+    Permit one very confident three-digit result as a fallback.
   */
   if (
-    best.count >= 2 ||
-    best.highestConfidence >= 80
+    best.level >= 100 &&
+    best.bestConfidence >= 85
   ) {
     return best.level;
   }
@@ -584,14 +614,14 @@ async function readPsnLevel(
   worker,
   nickname
 ) {
-  const images = await createOcrImages(cardBuffer);
+  const variants = await makeOcrVariants(cardBuffer);
   const results = [];
 
-  for (const image of images) {
+  for (const variant of variants) {
     try {
-      const result = await recognizeOcrImage(
+      const result = await recognizeVariant(
         worker,
-        image,
+        variant,
         nickname
       );
 
@@ -601,12 +631,18 @@ async function readPsnLevel(
     } catch (error) {
       console.log(
         `OCR failed for ${nickname} ` +
-        `${image.name}: ${error.message}`
+        `${variant.name}: ${error.message}`
       );
     }
   }
 
-  return chooseBestLevel(results);
+  const level = chooseBestLevel(results);
+
+  console.log(
+    `Selected PSN level for ${nickname}: ${level || "not detected"}`
+  );
+
+  return level;
 }
 
 function sleep(milliseconds) {
@@ -704,7 +740,6 @@ async function main() {
       console.log(`Processing ${nickname}...`);
 
       const cardUrl = await getBestCardUrl(nickname);
-
       let psnLevel = 0;
 
       try {
@@ -727,16 +762,6 @@ async function main() {
         cardUrl: cardUrl,
         psnLevel: psnLevel
       });
-
-      if (psnLevel > 0) {
-        console.log(
-          `Final PSN level for ${nickname}: ${psnLevel}`
-        );
-      } else {
-        console.log(
-          `PSN level not detected for ${nickname}`
-        );
-      }
 
       await sleep(1000);
     }
