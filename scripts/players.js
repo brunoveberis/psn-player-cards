@@ -142,7 +142,7 @@ async function getBestCardUrl(nickname) {
 
     if (generatedCardUrl) {
       console.log(
-        `Generated card URL for ${nickname}: ${generatedCardUrl}`
+        `Generated card for ${nickname}: ${generatedCardUrl}`
       );
 
       return generatedCardUrl;
@@ -159,7 +159,7 @@ async function getBestCardUrl(nickname) {
 
     if (profileCardUrl) {
       console.log(
-        `Profile card URL for ${nickname}: ${profileCardUrl}`
+        `Profile card for ${nickname}: ${profileCardUrl}`
       );
 
       return profileCardUrl;
@@ -207,25 +207,19 @@ async function downloadCard(cardUrl) {
   return Buffer.from(await response.arrayBuffer());
 }
 
-function getLevelCrop(metadata) {
-  if (!metadata.width || !metadata.height) {
-    throw new Error("Could not read card dimensions");
-  }
-
+function getScaledLevelCrop(imageWidth, imageHeight) {
   /*
-    Reference Exophase card dimensions: 425 x 142.
+    Reference card dimensions: 425 x 142.
 
-    The level number is located at:
-    left: 214
-    top: 5
-    right: 250
-    bottom: 35
+    Exact level-number area:
+    x = 214 through 250
+    y = 5 through 35
 
-    The coordinates are scaled when Exophase returns a card at
-    a different resolution.
+    This excludes the yellow icon and the trophy total.
   */
-  const scaleX = metadata.width / 425;
-  const scaleY = metadata.height / 142;
+
+  const scaleX = imageWidth / 425;
+  const scaleY = imageHeight / 142;
 
   const left = Math.round(214 * scaleX);
   const top = Math.round(5 * scaleY);
@@ -237,48 +231,73 @@ function getLevelCrop(metadata) {
     top: Math.max(0, top),
     width: Math.max(
       1,
-      Math.min(metadata.width - left, right - left)
+      Math.min(imageWidth - left, right - left)
     ),
     height: Math.max(
       1,
-      Math.min(metadata.height - top, bottom - top)
+      Math.min(imageHeight - top, bottom - top)
     )
   };
 }
 
-async function createOcrVariants(cardBuffer) {
+async function createLevelImages(cardBuffer) {
   const metadata = await sharp(cardBuffer).metadata();
-  const crop = getLevelCrop(metadata);
 
-  console.log(
-    `Card dimensions: ${metadata.width}x${metadata.height}`
+  if (!metadata.width || !metadata.height) {
+    throw new Error("Could not determine card dimensions");
+  }
+
+  const crop = getScaledLevelCrop(
+    metadata.width,
+    metadata.height
   );
 
   console.log(
-    `Level crop: left=${crop.left}, top=${crop.top}, ` +
+    `Card: ${metadata.width}x${metadata.height}`
+  );
+
+  console.log(
+    `Crop: x=${crop.left}, y=${crop.top}, ` +
     `width=${crop.width}, height=${crop.height}`
   );
 
-  const resizeOptions = {
-    width: 720,
-    height: 600,
-    fit: "fill",
-    kernel: sharp.kernel.lanczos3
-  };
+  /*
+    Keep the original aspect ratio.
+
+    The earlier code stretched and heavily transformed the crop,
+    which caused partial numbers and false readings.
+  */
+  const enlargedWidth = crop.width * 12;
+  const enlargedHeight = crop.height * 12;
 
   const padding = {
-    top: 80,
-    bottom: 80,
-    left: 80,
-    right: 80,
+    top: 60,
+    bottom: 60,
+    left: 60,
+    right: 60,
     background: "white"
   };
 
-  const base = sharp(cardBuffer).extract(crop);
+  const original = await sharp(cardBuffer)
+    .extract(crop)
+    .resize({
+      width: enlargedWidth,
+      height: enlargedHeight,
+      fit: "fill",
+      kernel: sharp.kernel.lanczos3
+    })
+    .extend(padding)
+    .png()
+    .toBuffer();
 
-  const normal = await base
-    .clone()
-    .resize(resizeOptions)
+  const grayscale = await sharp(cardBuffer)
+    .extract(crop)
+    .resize({
+      width: enlargedWidth,
+      height: enlargedHeight,
+      fit: "fill",
+      kernel: sharp.kernel.lanczos3
+    })
     .grayscale()
     .normalize()
     .sharpen()
@@ -286,115 +305,66 @@ async function createOcrVariants(cardBuffer) {
     .png()
     .toBuffer();
 
-  const contrast = await base
-    .clone()
-    .resize(resizeOptions)
+  const threshold140 = await sharp(cardBuffer)
+    .extract(crop)
+    .resize({
+      width: enlargedWidth,
+      height: enlargedHeight,
+      fit: "fill",
+      kernel: sharp.kernel.lanczos3
+    })
     .grayscale()
     .normalize()
-    .linear(2, -70)
-    .sharpen()
+    .threshold(140)
     .extend(padding)
     .png()
     .toBuffer();
 
-  const threshold120 = await base
-    .clone()
-    .resize(resizeOptions)
+  const threshold170 = await sharp(cardBuffer)
+    .extract(crop)
+    .resize({
+      width: enlargedWidth,
+      height: enlargedHeight,
+      fit: "fill",
+      kernel: sharp.kernel.lanczos3
+    })
     .grayscale()
     .normalize()
-    .sharpen()
-    .threshold(120)
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  const threshold145 = await base
-    .clone()
-    .resize(resizeOptions)
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .threshold(145)
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  const threshold170 = await base
-    .clone()
-    .resize(resizeOptions)
-    .grayscale()
-    .normalize()
-    .sharpen()
     .threshold(170)
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  const threshold195 = await base
-    .clone()
-    .resize(resizeOptions)
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .threshold(195)
-    .extend(padding)
-    .png()
-    .toBuffer();
-
-  const inverted = await base
-    .clone()
-    .resize(resizeOptions)
-    .grayscale()
-    .normalize()
-    .negate()
-    .sharpen()
-    .threshold(145)
     .extend(padding)
     .png()
     .toBuffer();
 
   return [
     {
-      name: "normal",
-      buffer: normal
+      name: "original",
+      buffer: original
     },
     {
-      name: "contrast",
-      buffer: contrast
+      name: "grayscale",
+      buffer: grayscale
     },
     {
-      name: "threshold-120",
-      buffer: threshold120
-    },
-    {
-      name: "threshold-145",
-      buffer: threshold145
+      name: "threshold-140",
+      buffer: threshold140
     },
     {
       name: "threshold-170",
       buffer: threshold170
-    },
-    {
-      name: "threshold-195",
-      buffer: threshold195
-    },
-    {
-      name: "inverted",
-      buffer: inverted
     }
   ];
 }
 
-function parseOcrLevel(text) {
-  const cleaned = String(text || "")
-    .replace(/\s/g, "")
+function parseLevel(text) {
+  const digits = String(text || "")
+    .replace(/\s+/g, "")
     .replace(/[^0-9]/g, "");
 
-  if (!/^[0-9]{1,3}$/.test(cleaned)) {
+  if (!/^\d{1,3}$/.test(digits)) {
     return 0;
   }
 
-  const level = Number.parseInt(cleaned, 10);
+  const level = Number.parseInt(digits, 10);
 
   if (
     !Number.isInteger(level) ||
@@ -407,16 +377,26 @@ function parseOcrLevel(text) {
   return level;
 }
 
-async function recognizeVariant(worker, variant, nickname) {
-  const result = await worker.recognize(variant.buffer);
+async function recognizeLevelImage(
+  worker,
+  levelImage,
+  nickname
+) {
+  const result = await worker.recognize(
+    levelImage.buffer
+  );
 
-  const rawText = String(result.data.text || "").trim();
-  const level = parseOcrLevel(rawText);
-  const confidence = Number(result.data.confidence || 0);
+  const rawText =
+    String(result.data.text || "").trim();
+
+  const level = parseLevel(rawText);
+
+  const confidence =
+    Number(result.data.confidence || 0);
 
   console.log(
-    `${nickname} ${variant.name}: ` +
-    `"${rawText}" => ${level || "not detected"} ` +
+    `${nickname} ${levelImage.name}: ` +
+    `"${rawText}" => ${level || "none"} ` +
     `(confidence ${confidence.toFixed(1)})`
   );
 
@@ -426,94 +406,104 @@ async function recognizeVariant(worker, variant, nickname) {
   };
 }
 
-function chooseLevel(results) {
-  const validResults = results.filter(function(result) {
-    return result.level >= 1 && result.level <= 999;
+function selectLevel(results) {
+  const valid = results.filter(function(result) {
+    return (
+      Number.isInteger(result.level) &&
+      result.level >= 1 &&
+      result.level <= 999
+    );
   });
 
-  if (!validResults.length) {
+  if (!valid.length) {
     return 0;
   }
 
-  const candidates = new Map();
+  const grouped = new Map();
 
-  for (const result of validResults) {
-    if (!candidates.has(result.level)) {
-      candidates.set(result.level, {
+  for (const result of valid) {
+    if (!grouped.has(result.level)) {
+      grouped.set(result.level, {
         level: result.level,
         votes: 0,
-        totalConfidence: 0,
-        bestConfidence: 0
+        confidence: 0
       });
     }
 
-    const candidate = candidates.get(result.level);
+    const candidate = grouped.get(result.level);
 
     candidate.votes++;
-    candidate.totalConfidence += result.confidence;
-    candidate.bestConfidence = Math.max(
-      candidate.bestConfidence,
-      result.confidence
-    );
+    candidate.confidence += result.confidence;
   }
 
-  const ranked = Array.from(candidates.values())
-    .sort(function(a, b) {
-      if (b.votes !== a.votes) {
-        return b.votes - a.votes;
-      }
+  const candidates = Array.from(
+    grouped.values()
+  ).sort(function(a, b) {
+    if (b.votes !== a.votes) {
+      return b.votes - a.votes;
+    }
 
-      if (b.totalConfidence !== a.totalConfidence) {
-        return b.totalConfidence - a.totalConfidence;
-      }
-
-      return b.bestConfidence - a.bestConfidence;
-    });
-
-  console.log("OCR candidates:");
-
-  ranked.forEach(function(candidate) {
-    console.log(
-      `  ${candidate.level}: ${candidate.votes} votes, ` +
-      `best confidence ${candidate.bestConfidence.toFixed(1)}`
-    );
+    return b.confidence - a.confidence;
   });
 
-  const best = ranked[0];
+  console.log(
+    "Candidates: " +
+    candidates
+      .map(function(candidate) {
+        return (
+          candidate.level +
+          " (" +
+          candidate.votes +
+          " votes)"
+        );
+      })
+      .join(", ")
+  );
 
+  const best = candidates[0];
+
+  /*
+    At least two independent image versions must agree.
+
+    A single incorrect reading is saved as 0 instead of damaging
+    the complete ranking.
+  */
   if (best.votes >= 2) {
-    return best.level;
-  }
-
-  if (best.bestConfidence >= 80) {
     return best.level;
   }
 
   return 0;
 }
 
-async function readPsnLevel(cardBuffer, worker, nickname) {
-  const variants = await createOcrVariants(cardBuffer);
+async function readPsnLevel(
+  cardBuffer,
+  worker,
+  nickname
+) {
+  const levelImages =
+    await createLevelImages(cardBuffer);
+
   const results = [];
 
-  for (const variant of variants) {
+  for (const levelImage of levelImages) {
     try {
-      results.push(
-        await recognizeVariant(
+      const result =
+        await recognizeLevelImage(
           worker,
-          variant,
+          levelImage,
           nickname
-        )
-      );
+        );
+
+      results.push(result);
     } catch (error) {
       console.log(
-        `OCR ${variant.name} failed for ${nickname}: ` +
-        error.message
+        `OCR failed for ${nickname} ` +
+        `${levelImage.name}: ${error.message}`
       );
     }
   }
 
-  return chooseLevel(results);
+  return selectLevel(results);
 }
 
 async function loadNamesFromSheet() {
@@ -588,17 +578,21 @@ function sleep(milliseconds) {
 }
 
 async function main() {
-  console.log("Loading players from Google Sheets...");
+  console.log(
+    "Loading players from Google Sheets..."
+  );
 
   const names = await loadNamesFromSheet();
 
-  console.log(`Found ${names.length} unique players.`);
+  console.log(
+    `Found ${names.length} unique players.`
+  );
 
   const worker = await createWorker("eng");
 
   await worker.setParameters({
     tessedit_char_whitelist: "0123456789",
-    tessedit_pageseg_mode: PSM.SINGLE_WORD,
+    tessedit_pageseg_mode: PSM.SINGLE_LINE,
     preserve_interword_spaces: "0",
     user_defined_dpi: "300"
   });
@@ -610,12 +604,14 @@ async function main() {
       console.log("");
       console.log(`Processing ${nickname}...`);
 
-      const cardUrl = await getBestCardUrl(nickname);
+      const cardUrl =
+        await getBestCardUrl(nickname);
 
       let psnLevel = 0;
 
       try {
-        const cardBuffer = await downloadCard(cardUrl);
+        const cardBuffer =
+          await downloadCard(cardUrl);
 
         psnLevel = await readPsnLevel(
           cardBuffer,
@@ -624,7 +620,7 @@ async function main() {
         );
       } catch (error) {
         console.log(
-          `Could not read level for ${nickname}: ` +
+          `Could not read ${nickname}: ` +
           error.message
         );
       }
@@ -637,7 +633,8 @@ async function main() {
       });
 
       console.log(
-        `Final level for ${nickname}: ${psnLevel}`
+        `Final PSN level for ` +
+        `${nickname}: ${psnLevel}`
       );
 
       await sleep(800);
@@ -659,13 +656,16 @@ async function main() {
 
   players.forEach(function(player, index) {
     console.log(
-      `${index + 1}. ${player.name}: ${player.psnLevel}`
+      `${index + 1}. ` +
+      `${player.name}: ` +
+      `${player.psnLevel}`
     );
   });
 
   console.log("");
   console.log(
-    `Updated ${OUTPUT_FILE} with ${players.length} players.`
+    `Updated ${OUTPUT_FILE} with ` +
+    `${players.length} players.`
   );
 }
 
