@@ -22,12 +22,6 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Create temporary npm project
-        run: npm init -y
-
-      - name: Install required packages
-        run: npm install sharp@0.34.3 tesseract.js@6.0.1
-
       - name: Generate players.json
         env:
           GOOGLE_SHEET_CSV_URL: ${{ secrets.GOOGLE_SHEET_CSV_URL }}
